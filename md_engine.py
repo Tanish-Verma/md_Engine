@@ -39,6 +39,10 @@ class MDSimulation:
         self.animate_frame_skip = animate_frame_skip
         self.animate_temperatures = animate_temperatures if animate_temperatures is not None \
             else self.temperatures
+        self.kin_E = np.zeros(self.equil_steps + self.prod_steps)
+        self.pot_E = np.zeros(self.equil_steps + self.prod_steps)
+        self.tot_E = np.zeros(self.equil_steps + self.prod_steps)
+        self.P = np.zeros((self.equil_steps + self.prod_steps, 3))
 
     @classmethod
     def with_defaults(cls):
@@ -183,6 +187,10 @@ class MDSimulation:
             print(f"  Equilibrating ({self.equil_steps} steps)...")
             for step in range(self.equil_steps):
                 pos, vel, pe, force = self._verlet_step(pos, vel, force, L, nb_list)
+                self.pot_E[step] = pe
+                self.P[step] = np.sum(vel, axis=0)
+                self.kin_E[step] = 0.5*np.sum(vel**2)
+                self.tot_E[step] = self.pot_E[step] + self.kin_E[step]
                 if self._needs_rebuild(pos, pos_ref, L):
                     nb_list, pos_ref = self._update_neighbor_list(pos, L), pos.copy()
                 if step % self.rescale_interval == 0:
@@ -194,6 +202,10 @@ class MDSimulation:
 
             for step in range(self.prod_steps):
                 pos, vel, pe, force = self._verlet_step(pos, vel, force, L, nb_list)
+                self.pot_E[step+self.equil_steps] = pe
+                self.P[step+self.equil_steps] = np.sum(vel, axis=0)
+                self.kin_E[step+self.equil_steps] = 0.5*np.sum(vel**2)
+                self.tot_E[step+self.equil_steps] = self.pot_E[step+self.equil_steps] + self.kin_E[step+self.equil_steps]
                 if self._needs_rebuild(pos, pos_ref, L):
                     nb_list, pos_ref = self._update_neighbor_list(pos, L), pos.copy()
                 if step % self.rdf_interval == 0:
@@ -217,7 +229,40 @@ class MDSimulation:
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig(output_file, dpi=150)
+        plt.show()
         print(f"\nComplete. Plot saved as '{output_file}'")
+    
+    def run_diagnostics(self, output_files = ["energy_plot.pdf", "momentum_plot.pdf"]):
+        steps_arr = np.arange(self.equil_steps + self.prod_steps)
+        plt.plot(steps_arr, self.kin_E,      label='Kinetic Energy',    color='blue',  alpha=0.6)
+        plt.plot(steps_arr, self.pot_E,      label='Potential Energy',    color='green', alpha=0.6)
+        plt.plot(steps_arr, self.tot_E, label='Total Energy', color='red',   linewidth=2)
+        plt.axvspan(0, self.equil_steps, alpha=0.1, color='gray', label='Equilibration')
+        plt.xlabel('Step'); plt.ylabel('Energy (reduced units)')
+        plt.title('Energy Conservation  |  ' + str(4*self.n_cells**3) + ' atoms')
+        plt.legend(); plt.grid(True, linestyle='--', alpha=0.5)
+        plt.savefig(output_files[0], dpi=150)
+        plt.show()
+        P_mag = np.linalg.norm(self.P, axis=1)
+        plt.plot(steps_arr, P_mag,      label='Total Momentum (P)',    color='black',  linewidth=2)
+        plt.xlabel('Step'); plt.ylabel('Total Momentum (reduced units)')
+        plt.title('Momentum Conservation  |  ' + str(4*self.n_cells**3) + ' atoms')
+        plt.legend(); plt.grid(True, linestyle='--', alpha=0.5)
+        plt.savefig(output_files[1], dpi=150)
+        plt.show()
+        E_mean = np.mean(self.tot_E[self.equil_steps:])
+        E_fluc = np.std(self.tot_E[self.equil_steps:])
+        rel_fluc = E_fluc/np.abs(E_mean)
+        print(f"Mean Total Energy is {E_mean} and RMS Fluctuation is {E_fluc}\n")
+        if(rel_fluc < 1e-4):
+            print(f"With a relative fluctuation of {rel_fluc} < 1e-4, the system is numerically stable!\n")
+        else:
+            print(f"With a relative fluctuation of {rel_fluc} > 1e-4, the system is numerically unstable.\n")
+        P_x = np.max(np.abs(self.P[:, 0]))
+        P_y = np.max(np.abs(self.P[:, 1]))
+        P_z = np.max(np.abs(self.P[:, 2]))
+        print(f"The max values of components P_x, P_y and P_z are {P_x}, {P_y} and {P_z} respectively\n")
+
 
     def _classify_phase(self, signals):
         peak_g = signals.get('peak_g', 0)
@@ -228,7 +273,7 @@ class MDSimulation:
         else:
             phase = 'GAS'
         return phase, signals
-
+    
     # ------------------------------------------------------------------ animate
     def animate(self, output_file="md_engine.gif"):
         import os
@@ -439,10 +484,12 @@ if __name__ == "__main__":
         if choice == "1":
             sim = MDSimulation.with_defaults()
             sim.run()
+            sim.run_diagnostics()
             break
         elif choice == "2":
             sim = MDSimulation.with_defaults()
             sim.run(animate=True)
+            sim.run_diagnostics()
             break
         else:
             print("  Please enter 1 or 2.")
