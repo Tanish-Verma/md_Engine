@@ -262,6 +262,7 @@ class MDSimulation:
         P_y = np.max(np.abs(self.P[:, 1]))
         P_z = np.max(np.abs(self.P[:, 2]))
         print(f"The max values of components P_x, P_y and P_z are {P_x}, {P_y} and {P_z} respectively\n")
+        print("Done running Diagnostics.\n")
 
 
     def _classify_phase(self, signals):
