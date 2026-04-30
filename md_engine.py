@@ -502,12 +502,10 @@ def _classify_phase(peak_g):
     return "GAS"
 
 
-def animate(sim, output_file="md_engine.gif"):
-    import os
+def animate(sim, output_file="md_engine",format = "both"):
 
-    base     = os.path.splitext(output_file)[0]
-    gif_file = base + ".gif"
-    mp4_file = base + ".mp4"
+    gif_file = output_file + ".gif"
+    mp4_file = output_file + ".mp4"
 
     pos0, L  = sim.generate_fcc_lattice()
     N        = len(pos0)
@@ -574,6 +572,7 @@ def animate(sim, output_file="md_engine.gif"):
     print(f"\nTotal frames: {total_frames}.  Building figure...")
 
     fig = plt.figure(figsize=(11, 5.5), facecolor="#0d0d0d")
+    fig.set_size_inches(11, 5.6)
     gs  = fig.add_gridspec(1, 2, wspace=0.3, left=0.05, right=0.97, top=0.80, bottom=0.13)
     ax_slab = fig.add_subplot(gs[0])
     ax_rdf  = fig.add_subplot(gs[1])
@@ -651,25 +650,33 @@ def animate(sim, output_file="md_engine.gif"):
 
     ani = FuncAnimation(fig, update, frames=total_frames, interval=60, blit=False)
 
-    print(f"\nSaving GIF  → '{gif_file}' ({total_frames} frames) ...")
-    try:
-        ani.save(gif_file, writer="pillow", fps=20, dpi=130)
-        print(f"  ✓ GIF saved: '{gif_file}'")
-    except Exception as e:
-        print(f"  ✗ GIF failed: {e}")
+    if format in ("gif", "both"):
+        print(f"\nSaving GIF  → '{gif_file}' ({total_frames} frames) ...")
+        try:
+            ani.save(gif_file, writer="pillow", fps=20, dpi=130)
+            print(f"  ✓ GIF saved: '{gif_file}'")
+        except Exception as e:
+            print(f"  ✗ GIF failed: {e}")
 
-    print(f"Saving MP4  → '{mp4_file}' ({total_frames} frames) ...")
-    try:
-        from matplotlib.animation import FFMpegWriter
-        mp4_writer = FFMpegWriter(fps=20, codec="libx264",
-                                  extra_args=["-pix_fmt", "yuv420p",
-                                              "-crf", "18", "-preset", "fast"])
-        ani.save(mp4_file, writer=mp4_writer, dpi=130)
-        print(f"  ✓ MP4 saved: '{mp4_file}'")
-    except Exception as e:
-        print(f"  ✗ MP4 failed: {e}")
-        print("    Make sure FFmpeg is installed: conda install ffmpeg  or  apt install ffmpeg")
-
+# ---- MP4 ----
+    if format in ("mp4", "both"):
+        print(f"Saving MP4  → '{mp4_file}' ({total_frames} frames) ...")
+        try:
+            from matplotlib.animation import FFMpegWriter
+            mp4_writer = FFMpegWriter(
+                fps=20,
+                codec="libx264",
+                extra_args=[
+                    "-pix_fmt", "yuv420p",
+                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # 👈 FIX
+                    "-crf", "18",
+                    "-preset", "fast"
+                ]
+            )
+            ani.save(mp4_file, writer=mp4_writer, dpi=130)
+            print(f"  ✓ MP4 saved: '{mp4_file}'")
+        except Exception as e:
+            print(f"  ✗ MP4 failed: {e}")
     try:
         plt.show()
     except Exception:
@@ -711,6 +718,14 @@ if __name__ == "__main__":
     if choice == "1":
         sim.run(run_diag=run_diag, diag_output_dir=diag_dir)
     else:
-        animate(sim)
+        while True:
+            fmt = input("\nOutput format? [gif/mp4/both] (default: both): ").strip().lower()
+            if fmt in ("", "both"):
+                fmt = "both"
+                break
+            elif fmt in ("gif", "mp4"):
+                break
+            print("  Please enter gif, mp4, or both.")
+        animate(sim,fmt = fmt)
         if run_diag:
             run_diagnostics(sim, output_dir=diag_dir)
