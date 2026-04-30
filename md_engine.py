@@ -52,12 +52,18 @@ class MDSimulation:
         self.rdf_bins         = rdf_bins
         plot_rdf              = bool(input("\nPlot RDF after simulation? [y/n] (default: y): ").strip().lower() or "y" == "y")
         self.plot_rdf         = plot_rdf
-        self.n_workers        = n_workers          # None → use os.cpu_count()
 
         # T* sweep (reduced temperatures)
         self.t_star_values = (t_star_values
                               if t_star_values is not None
                               else [0.01, 0.2, 0.4, 0.6, 0.8, 1.0])
+
+        if n_workers is None:
+            cpu_count = os.cpu_count() or 1
+            n_tasks = len(self.t_star_values)
+            self.n_workers = min(n_tasks, cpu_count)
+        else:
+            self.n_workers = n_workers
 
         self.animate_equil_steps    = animate_equil_steps
         self.animate_prod_steps     = animate_prod_steps
