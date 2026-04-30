@@ -27,7 +27,6 @@ class MDSimulation:
                  rescale_interval=10,
                  rdf_interval=10,
                  rdf_bins=200,
-                 plot_rdf=True,
                  t_star_values=None,
                  animate_equil_steps=200,
                  animate_prod_steps=200,
@@ -51,6 +50,7 @@ class MDSimulation:
         self.rescale_interval = rescale_interval
         self.rdf_interval     = rdf_interval
         self.rdf_bins         = rdf_bins
+        plot_rdf              = bool(input("\nPlot RDF after simulation? [y/n] (default: y): ").strip().lower() or "y" == "y")
         self.plot_rdf         = plot_rdf
         self.n_workers        = n_workers          # None → use os.cpu_count()
 
