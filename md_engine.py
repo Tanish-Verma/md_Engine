@@ -27,6 +27,7 @@ class MDSimulation:
                  rescale_interval=10,
                  rdf_interval=10,
                  rdf_bins=200,
+                 plot_rdf=True,
                  t_star_values=None,
                  animate_equil_steps=200,
                  animate_prod_steps=200,
@@ -50,6 +51,7 @@ class MDSimulation:
         self.rescale_interval = rescale_interval
         self.rdf_interval     = rdf_interval
         self.rdf_bins         = rdf_bins
+        self.plot_rdf         = plot_rdf
         self.n_workers        = n_workers          # None → use os.cpu_count()
 
         # T* sweep (reduced temperatures)
@@ -101,6 +103,8 @@ class MDSimulation:
         rescale_interval = prompt("velocity rescale every N steps", 10, int)
         rdf_interval     = prompt("RDF sample every N steps", 10, int)
         rdf_bins         = prompt("RDF histogram bins", 200, int)
+        plot_rdf         = prompt("plot RDF? (1=yes, 0=no)", 1, int)
+        plot_rdf         = bool(plot_rdf)
 
         print("\n--- Temperature sweep (T* = reduced temperature) ---")
         raw = input("  T* values space-separated [0.01 0.2 0.4 0.6 0.8 1.0]: ").strip()
@@ -120,7 +124,7 @@ class MDSimulation:
             dt=dt, r_cutoff=r_cutoff, r_skin=r_skin,
             equil_steps=equil_steps, prod_steps=prod_steps,
             rescale_interval=rescale_interval, rdf_interval=rdf_interval,
-            rdf_bins=rdf_bins, t_star_values=t_star_values,
+            rdf_bins=rdf_bins, plot_rdf=plot_rdf, t_star_values=t_star_values,
             animate_equil_steps=animate_equil_steps,
             animate_prod_steps=animate_prod_steps,
             animate_frame_skip=animate_frame_skip,
@@ -384,6 +388,15 @@ class MDSimulation:
         for T_star, r_centers, g_avg, peak_g, diag in results:
             self.diagnostics[T_star] = diag
 
+        if self.plot_rdf:
+            self.plot_radial_distribution_function(output_file, results)
+
+        if run_diag:
+            run_diagnostics(self, output_dir=diag_output_dir)
+
+        return results
+
+    def plot_radial_distribution_function(self, output_file, results):
         plt.figure(figsize=(10, 6))
         for T_star, r_centers, g_avg, peak_g, diag in results:
             T_K   = T_star * self.eps_kb
@@ -402,11 +415,6 @@ class MDSimulation:
         plt.savefig(output_file, dpi=150)
         plt.show()
         print(f"\nComplete. Plot saved as '{output_file}'")
-
-        if run_diag:
-            run_diagnostics(self, output_dir=diag_output_dir)
-
-        return results
 
 
 # ------------------------------------------------------------------ diagnostics
@@ -698,25 +706,27 @@ if __name__ == "__main__":
         print("  Please enter 1 or 2.")
 
     # Ask whether to run diagnostics
-    while True:
-        diag_choice = input("\nRun diagnostics after simulation? [y/n] (default: y): ").strip().lower()
-        if diag_choice in ("", "y", "yes"):
-            run_diag = True
-            break
-        elif diag_choice in ("n", "no"):
-            run_diag = False
-            break
-        print("  Please enter y or n.")
+    if choice == "1":
+        while True:
+            diag_choice = input("\nRun diagnostics after simulation? [y/n] (default: y): ").strip().lower()
+            if diag_choice in ("", "y", "yes"):
+                run_diag = True
+                break
+            elif diag_choice in ("n", "no"):
+                run_diag = False
+                break
+            print("  Please enter y or n.")
 
-    diag_dir = "diagnostics"
-    if run_diag:
-        raw_dir = input(f"  Diagnostics output folder [diagnostics]: ").strip()
-        diag_dir = raw_dir if raw_dir else "diagnostics"
+        diag_dir = "diagnostics"
+        if run_diag:
+            raw_dir = input(f"  Diagnostics output folder [diagnostics]: ").strip()
+            diag_dir = raw_dir if raw_dir else "diagnostics"
 
     sim = MDSimulation.with_defaults()
-
     if choice == "1":
         sim.run(run_diag=run_diag, diag_output_dir=diag_dir)
+        if run_diag:
+            run_diagnostics(sim, output_dir=diag_dir)
     else:
         while True:
             fmt = input("\nOutput format? [gif/mp4/both] (default: both): ").strip().lower()
@@ -726,6 +736,4 @@ if __name__ == "__main__":
             elif fmt in ("gif", "mp4"):
                 break
             print("  Please enter gif, mp4, or both.")
-        animate(sim,fmt = fmt)
-        if run_diag:
-            run_diagnostics(sim, output_dir=diag_dir)
+        animate(sim,format = fmt)
