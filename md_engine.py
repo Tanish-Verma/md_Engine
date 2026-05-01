@@ -16,7 +16,7 @@ def prompt(label, default, cast=float):
 class MDSimulation:
     def __init__(self,
                  sigma=3.405,
-                 eps= 0.0140 * 1.60218e-19,
+                 eps= 2.183e-21,
                  n_cells=4,
                  rho_star=0.8442,
                  dt=0.005,
@@ -56,7 +56,7 @@ class MDSimulation:
         # T* sweep (reduced temperatures)
         self.t_star_values = (t_star_values
                               if t_star_values is not None
-                              else [0.01, 0.2, 0.4, 0.6, 0.8, 1.0])
+                              else [0.001])
 
         if n_workers is None:
             cpu_count = os.cpu_count() or 1
@@ -114,7 +114,7 @@ class MDSimulation:
 
         print("\n--- Temperature sweep (T* = reduced temperature) ---")
         raw = input("  T* values space-separated [0.01 0.2 0.4 0.6 0.8 1.0]: ").strip()
-        t_star_values = [float(t) for t in raw.split()] if raw else [0.01, 0.2, 0.4, 0.6, 0.8, 1.0]
+        t_star_values = [float(t) for t in raw.split()] if raw else [0.001]
 
         print("\n--- Parallel workers ---")
         n_workers = prompt("worker processes (0 = auto)", 0, int)
@@ -728,7 +728,11 @@ if __name__ == "__main__":
             raw_dir = input(f"  Diagnostics output folder [diagnostics]: ").strip()
             diag_dir = raw_dir if raw_dir else "diagnostics"
 
-    sim = MDSimulation.with_defaults()
+    default = bool(input("\nUse default parameters? [y/n] (default: y): ").strip().lower() in ("", "y", "yes"))
+    if default:
+        sim = MDSimulation.with_defaults()
+    else:
+        sim = MDSimulation.from_user_input()
     if choice == "1":
         sim.run(run_diag=run_diag, diag_output_dir=diag_dir)
         if run_diag:
