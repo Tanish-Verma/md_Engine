@@ -11,34 +11,75 @@ def prompt(label, default, cast=float):
     return cast(val) if val else cast(default)
 
 
+# ================================================================== INERT GAS DATABASE
+
+INERT_GASES = {
+    "Ar": {
+        "name": "Argon",
+        "sigma": 3.40,
+        "epsilon": 0.0104,
+    },
+    "Kr": {
+        "name": "Krypton",
+        "sigma": 3.65,
+        "epsilon": 0.0140,
+    },
+    "Xe": {
+        "name": "Xenon",
+        "sigma": 3.98,
+        "epsilon": 0.0200,
+    },
+    "Ne": {
+        "name": "Neon",
+        "sigma": 2.74,
+        "epsilon": 0.0031,
+    },
+}
+
+
+
 
 
 class MDSimulation:
     def __init__(self,
-                 sigma=3.405,
-                 eps= 2.183e-21,
+                 sigma=3.65,
+                 eps= 0.0140,
                  n_cells=4,
-                 rho_star=0.8442,
+                 rho_star=None,
+                 cell_param_a=None,
                  dt=0.005,
                  r_cutoff=2.5,
                  r_skin=3.0,
                  equil_steps=2000,
-                 prod_steps=2000,
+                 prod_steps=4000,
                  rescale_interval=10,
                  rdf_interval=10,
                  rdf_bins=200,
+                 plot_rdf = True,
                  t_star_values=None,
-                 animate_equil_steps=200,
-                 animate_prod_steps=200,
-                 animate_frame_skip=2,
+                 animate_equil_steps=2000,
+                 animate_prod_steps=2000,
+                 animate_frame_skip=10,
                  animate_t_star_values=None,
                  n_workers=None):
 
         self.sigma            = sigma
         self.eps              = eps
-        self.eps_kb           = eps / k_B          # ε/k_B in Kelvin
+        self.eps_kb           = eps*(1.603e-19 / k_B )         # ε/k_B in Kelvin
         self.n_cells          = n_cells
-        self.rho_star         = rho_star
+        
+        # Handle rho_star vs cell_param_a
+        if cell_param_a is not None:
+            # Derive rho_star from cell_param_a
+            L = cell_param_a * n_cells
+            self.rho_star = 4 * n_cells ** 3 / (L ** 3)
+            self.cell_param_a = cell_param_a
+            print(f"  Cell parameter a = {cell_param_a:.4f} σ")
+            print(f"  Derived ρ* = {self.rho_star:.4f}")
+        else:
+            self.rho_star = rho_star if rho_star is not None else 0.8442
+            self.cell_param_a = None
+        
         self.dt               = dt
         self.r_cutoff         = r_cutoff
         self.r_skin           = r_skin
@@ -50,13 +91,12 @@ class MDSimulation:
         self.rescale_interval = rescale_interval
         self.rdf_interval     = rdf_interval
         self.rdf_bins         = rdf_bins
-        plot_rdf              = bool(input("\nPlot RDF after simulation? [y/n] (default: y): ").strip().lower() or "y" == "y")
         self.plot_rdf         = plot_rdf
 
         # T* sweep (reduced temperatures)
         self.t_star_values = (t_star_values
                               if t_star_values is not None
-                              else [0.001])
+                              else [0.01, 0.2, 0.4, 0.6, 0.8, 1.0])
 
         if n_workers is None:
             cpu_count = os.cpu_count() or 1
@@ -77,7 +117,6 @@ class MDSimulation:
         self.diagnostics = {}   # T_star -> dict with kin_E, pot_E, tot_E, P
 
     # ------------------------------------------------------------------ constructors
-
     @classmethod
     def with_defaults(cls):
         print("\n[Using default parameters]")
@@ -87,14 +126,23 @@ class MDSimulation:
     def from_user_input(cls):
         print("\n[Press Enter to keep default]")
 
-        print("\n--- Physical constants ---")
-        sigma = prompt("sigma (Å)", 3.405)
-        eps   = prompt("epsilon (J)  [Ar default: 2.183e-21]", 2.183e-21)
-        print(f"  → eps/kB = {eps / k_B:.4f} K")
+        print("\n--- Gas Selection ---")
+        sigma, eps = MDSimulation.select_inert_gas()
 
         print("\n--- System setup ---")
         n_cells  = prompt("unit cells per side", 4, int)
-        rho_star = prompt("reduced density ρ*", 0.8442)
+        
+        print("\n  Density specification:")
+        print("    [1] Use ρ* (reduced number density)")
+        print("    [2] Use cell parameter a (lattice constant)")
+        density_mode = input("  Choose [1] or [2] (default: 1): ").strip()
+        
+        if density_mode == "2":
+            cell_param_a = prompt("cell parameter a (in σ)", 1.68)
+            rho_star = None
+        else:
+            cell_param_a = None
+            rho_star = prompt("number density ρ*", 0.8442)
 
         print("\n--- Integration ---")
         dt = prompt("time step dt", 0.005)
@@ -104,8 +152,8 @@ class MDSimulation:
         r_skin   = prompt("skin radius r_skin", 3.0)
 
         print("\n--- Run length ---")
-        equil_steps      = prompt("equilibration steps", 1000, int)
-        prod_steps       = prompt("production steps", 1000, int)
+        equil_steps      = prompt("equilibration steps", 2000, int)
+        prod_steps       = prompt("production steps", 4000, int)
         rescale_interval = prompt("velocity rescale every N steps", 10, int)
         rdf_interval     = prompt("RDF sample every N steps", 10, int)
         rdf_bins         = prompt("RDF histogram bins", 200, int)
@@ -114,19 +162,20 @@ class MDSimulation:
 
         print("\n--- Temperature sweep (T* = reduced temperature) ---")
         raw = input("  T* values space-separated [0.01 0.2 0.4 0.6 0.8 1.0]: ").strip()
-        t_star_values = [float(t) for t in raw.split()] if raw else [0.001]
+        t_star_values = [float(t) for t in raw.split()] if raw else [0.01, 0.2, 0.4, 0.6, 0.8, 1.0]
 
         print("\n--- Parallel workers ---")
         n_workers = prompt("worker processes (0 = auto)", 0, int)
         n_workers = None if n_workers == 0 else n_workers
 
         print("\n--- Animation options ---")
-        animate_equil_steps = prompt("animation equil steps per T*", 200, int)
-        animate_prod_steps  = prompt("animation production steps per T*", 200, int)
-        animate_frame_skip  = prompt("save every N-th frame", 2, int)
+        animate_equil_steps = prompt("animation equil steps per T*", 2000, int)
+        animate_prod_steps  = prompt("animation production steps per T*", 2000, int)
+        animate_frame_skip  = prompt("save every N-th frame", 10, int)
 
         return cls(
             sigma=sigma, eps=eps, n_cells=n_cells, rho_star=rho_star,
+            cell_param_a=cell_param_a,
             dt=dt, r_cutoff=r_cutoff, r_skin=r_skin,
             equil_steps=equil_steps, prod_steps=prod_steps,
             rescale_interval=rescale_interval, rdf_interval=rdf_interval,
@@ -137,7 +186,43 @@ class MDSimulation:
             n_workers=n_workers,
         )
 
+    # ------------------------------------------------------------------ helpers for input and display
+    @staticmethod
+    def display_inert_gas_table():
+        """Display available inert gases in a nice table."""
+        print("\n" + "=" * 70)
+        print("  INERT GAS DATABASE  (Lennard-Jones Parameters)")
+        print("=" * 70)
+        print(f"{'Key':<6} {'Gas':<12} {'σ (Å)':<12} {'ε (eV)':<12}")
+        print("-" * 70)
+        for key, props in INERT_GASES.items():
+            print(f"{key:<6} {props['name']:<12} {props['sigma']:<12.2f} {props['epsilon']:<12.4f}")
+        print("=" * 70 + "\n")
 
+
+    @staticmethod
+    def select_inert_gas():
+        """Interactive selection of inert gas from database."""
+        MDSimulation.display_inert_gas_table()
+        
+        while True:
+            choice = input("  Select gas [Ar/Kr/Xe/Ne] or [custom]: ").strip()
+            if choice in INERT_GASES:
+                gas = INERT_GASES[choice]
+                print(f"\n  ✓ Selected {gas['name']}")
+                print(f"    σ = {gas['sigma']} Å")
+                print(f"    ε = {gas['epsilon']} eV\n")
+                return gas["sigma"], gas["epsilon"]
+            elif choice.lower() == "custom":
+                print("\n  [Custom parameters]")
+                sigma = prompt("sigma (Å)", 3.40)
+                eps = prompt("epsilon (eV)", 0.0104)
+                return sigma, eps
+            else:
+                print("  Invalid choice. Please enter Ar, Kr, Xe, Ne, or custom.")
+
+
+    # ------------------------------------------------------------------ physics and simulation methods
     def lj_properties(self, r_sq):
         rc_sq   = self.r_cutoff_sq
         inv_rc2 = 1.0 / rc_sq
@@ -350,27 +435,26 @@ class MDSimulation:
                 count += 1
 
         g_avg  = g_acc / count
-        peak_g = float(np.max(g_avg))
-        print(f"  [T* = {T_star:.3f}]  done — {count} RDF samples, g(r) peak = {peak_g:.2f}",
-            flush=True)
-
+        
         diag = {
             "kin_E": kin_E_trace,
             "pot_E": pot_E_trace,
             "tot_E": tot_E_trace,
             "P":     P_trace,
+            "g_avg": g_avg,
+            "r_centers": r_centers,
         }
 
-        return T_star, r_centers, g_avg, peak_g, diag
+        return T_star, r_centers, g_avg, diag
 
 
     def run(self, output_file="melting_rdf.pdf", run_diag=True, diag_output_dir="diagnostics"):
         pos0, L = self.generate_fcc_lattice()
         N       = len(pos0)
         print(f"\nSystem: N = {N} atoms, L = {L:.4f} σ")
-        print(f"ε/k_B = {self.eps_kb:.4f} K   (ε = {self.eps:.4e} J,  k_B = {k_B:.6e} J/K)")
+        print(f"ε/k_B = {self.eps_kb:.4f} K   (ε = {self.eps:.4e} eV,  k_B = {k_B:.6e} J/K)")
         print(f"T* values: {self.t_star_values}")
-        print(f"Equivalent T (K): {[round(t * self.eps_kb, 2) for t in self.t_star_values]}")
+        print(f"Equivalent T (K): {[round(t * self.eps_kb, 3) for t in self.t_star_values]}")
         print(f"Launching {len(self.t_star_values)} workers (n_workers={self.n_workers})...\n")
 
         # Build argument tuples for each temperature (one per worker process)
@@ -386,12 +470,12 @@ class MDSimulation:
         with Pool(processes=self.n_workers) as pool:
             results = pool.map(MDSimulation._run_one_temperature, worker_args)
 
-        # results is a list of (T_star, r_centers, g_avg, peak_g, diag)
+        # results is a list of (T_star, r_centers, g_avg, diag)
         # sort by T* so the legend is ordered
         results.sort(key=lambda x: x[0])
 
         # Store diagnostics on self, keyed by T_star
-        for T_star, r_centers, g_avg, peak_g, diag in results:
+        for T_star, r_centers, g_avg, diag in results:
             self.diagnostics[T_star] = diag
 
         if self.plot_rdf:
@@ -404,14 +488,14 @@ class MDSimulation:
 
     def plot_radial_distribution_function(self, output_file, results):
         plt.figure(figsize=(10, 6))
-        for T_star, r_centers, g_avg, peak_g, diag in results:
+        for T_star, r_centers, g_avg, diag in results:
             T_K   = T_star * self.eps_kb
-            phase = _classify_phase(peak_g)
+            phase = _classify_phase(g_avg, r_centers)
             plt.plot(r_centers * self.sigma, g_avg,
-                     label=f"T* = {T_star:.2f}  ({T_K:.1f} K)  {phase}  peak={peak_g:.2f}")
-            print(f"  T* = {T_star:.3f}  T = {T_K:.2f} K  →  {phase}  (g(r) peak = {peak_g:.2f})")
+                     label=f"T* = {T_star:.3f}  ({T_K:.1f} K)  {phase}")
+            print(f"  T* = {T_star:.3f}  T = {T_K:.2f} K  →  {phase}")
 
-        plt.title("Radial Distribution Function $g(r)$ during Melting")
+        plt.title("Radial Distribution Function $g(r)$ for Lennard-Jones System for the provided T* values")
         plt.xlabel("Distance (Å)")
         plt.ylabel("$g(r)$")
         plt.axhline(1.0, color="black", linestyle="--", alpha=0.5)
@@ -423,12 +507,40 @@ class MDSimulation:
         print(f"\nComplete. Plot saved as '{output_file}'")
 
 
-# ------------------------------------------------------------------ diagnostics
+# ================================================================== PHASE CLASSIFICATION
+
+def _classify_phase(g_avg, r_centers):
+    """
+    Classify phase by examining convergence of g(r) to 1 at large distances.
+    Tolerates ±0.03 deviation from 1.0
+    
+    Parameters:
+      g_avg: array of g(r) values
+      r_centers: array of corresponding r values
+    
+    Returns:
+      "SOLID", "LIQUID", or "GAS"
+    """
+    # Look at the end (large r) region, e.g., last 10% of data
+    n_tail = max(1, len(g_avg) // 10)
+    g_tail = g_avg[-n_tail:]
+    
+    g_tail_mean = float(np.mean(g_tail))
+    # Check convergence: how close to 1.0?
+    deviation = abs(g_tail_mean - 1.0)
+    
+    if deviation < 0.03:
+        return "LIQUID"
+    else:
+        return "SOLID"
+
+
+# ================================================================== DIAGNOSTICS
 
 def run_diagnostics(sim, output_dir="diagnostics"):
     """
     Plot and save energy + momentum diagnostics for every temperature that was run.
-    Each temperature gets its own pair of PNG files saved under `output_dir/`.
+    Each temperature gets its own pair of PDF files saved under `output_dir/`.
     A console summary (mean energy, fluctuation, max momentum) is printed for each T*.
     """
     if not sim.diagnostics:
@@ -448,7 +560,6 @@ def run_diagnostics(sim, output_dir="diagnostics"):
     for T_star in sorted(sim.diagnostics):
         diag  = sim.diagnostics[T_star]
         T_K   = T_star * sim.eps_kb
-        phase = _classify_phase(float(np.max(diag["tot_E"])))   # rough; peak_g not stored here
         tag   = f"T_star_{T_star:.3f}".replace(".", "p")
 
         kin_E = diag["kin_E"]
@@ -468,7 +579,7 @@ def run_diagnostics(sim, output_dir="diagnostics"):
         ax_e.legend()
         ax_e.grid(True, linestyle="--", alpha=0.5)
         fig_e.tight_layout()
-        energy_file = os.path.join(output_dir, f"energy_{tag}.png")
+        energy_file = os.path.join(output_dir, f"energy_{tag}.pdf")
         fig_e.savefig(energy_file, dpi=150)
         plt.close(fig_e)
 
@@ -483,7 +594,7 @@ def run_diagnostics(sim, output_dir="diagnostics"):
         ax_p.legend()
         ax_p.grid(True, linestyle="--", alpha=0.5)
         fig_p.tight_layout()
-        momentum_file = os.path.join(output_dir, f"momentum_{tag}.png")
+        momentum_file = os.path.join(output_dir, f"momentum_{tag}.pdf")
         fig_p.savefig(momentum_file, dpi=150)
         plt.close(fig_p)
 
@@ -505,15 +616,6 @@ def run_diagnostics(sim, output_dir="diagnostics"):
 
     print(f"\n{'='*60}")
     print("Done running diagnostics.\n")
-
-
-
-def _classify_phase(peak_g):
-    if peak_g > 3.0:
-        return "SOLID"
-    elif peak_g > 1.8:
-        return "LIQUID"
-    return "GAS"
 
 
 def animate(sim, output_file="md_engine",format = "both"):
@@ -633,7 +735,7 @@ def animate(sim, output_file="md_engine",format = "both"):
 
     def update(fi):
         atom_xy, speed, r_centers, g_running, T_star_f, T_K_f, peak_g = frames[fi]
-        phase = _classify_phase(peak_g)
+        phase = _classify_phase(g_running, r_centers)
 
         sc.set_offsets(atom_xy)
         sc.set_array(speed)
@@ -642,9 +744,10 @@ def animate(sim, output_file="md_engine",format = "both"):
         for idx, (T_g, T_K_g, r_g, g_g) in enumerate(finished_rdfs):
             if T_g < T_star_f and idx not in drawn_ghosts:
                 col = ghost_cmap(idx / max(n_t - 1, 1))
+                phase_g = _classify_phase(g_g, r_g)
                 gl, = ax_rdf.plot(r_g * sim.sigma, g_g,
                                   color=col, lw=1.0, alpha=0.4,
-                                  label=f"T*={T_g:.2f}", zorder=2)
+                                  label=f"T*={T_g:.2f} ({phase_g})", zorder=2)
                 ghost_lines_rdf.append(gl)
                 ghost_handles.append(gl)
                 drawn_ghosts.add(idx)
@@ -682,7 +785,7 @@ def animate(sim, output_file="md_engine",format = "both"):
                 codec="libx264",
                 extra_args=[
                     "-pix_fmt", "yuv420p",
-                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # 👈 FIX
+                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                     "-crf", "18",
                     "-preset", "fast"
                 ]
@@ -697,53 +800,89 @@ def animate(sim, output_file="md_engine",format = "both"):
         pass
 
 
-if __name__ == "__main__":
-    print("=" * 55)
-    print("   Lennard-Jones MD Simulation — RDF Analysis")
-    print("=" * 55)
-    print(f"   scipy k_B = {k_B:.6e} J/K")
-    print("=" * 55)
-    print("\nParameter mode:\n  [1] Run Full Simulation (RDF Analysis)\n  [2] Run Animation Sweep")
+# ================================================================== MAIN WORKFLOW
 
+def main():
+    """
+    Improved main workflow:
+    1. Run simulation
+    2. Ask if user wants to animate
+    3. Ask if user wants to run another simulation
+    """
+    
+    print("\n" + "=" * 70)
+    print("   LENNARD-JONES MD SIMULATION — RDF ANALYSIS")
+    print("=" * 70)
+    
     while True:
-        choice = input("\nSelect option (1 or 2): ").strip()
-        if choice in ("1", "2"):
-            break
-        print("  Please enter 1 or 2.")
-
-    # Ask whether to run diagnostics
-    if choice == "1":
-        while True:
-            diag_choice = input("\nRun diagnostics after simulation? [y/n] (default: y): ").strip().lower()
-            if diag_choice in ("", "y", "yes"):
-                run_diag = True
-                break
-            elif diag_choice in ("n", "no"):
-                run_diag = False
-                break
-            print("  Please enter y or n.")
-
+        print("\n" + "-" * 70)
+        print("  NEW SIMULATION")
+        print("-" * 70)
+        
+        # Get user parameters
+        default = input("\nUse default parameters? [y/n] (default: y): ").strip().lower()
+        if default in ("", "y", "yes"):
+            sim = MDSimulation.with_defaults()
+        else:
+            sim = MDSimulation.from_user_input()
+        
+        # Ask whether to run diagnostics
+        print("\n--- Post-simulation analysis ---")
+        diag_choice = input("Run diagnostics after simulation? [y/n] (default: y): ").strip().lower()
+        run_diag = diag_choice in ("", "y", "yes")
+        
         diag_dir = "diagnostics"
         if run_diag:
             raw_dir = input(f"  Diagnostics output folder [diagnostics]: ").strip()
             diag_dir = raw_dir if raw_dir else "diagnostics"
-
-    default = bool(input("\nUse default parameters? [y/n] (default: y): ").strip().lower() in ("", "y", "yes"))
-    if default:
-        sim = MDSimulation.with_defaults()
-    else:
-        sim = MDSimulation.from_user_input()
-    if choice == "1":
-        sim.run(run_diag=run_diag, diag_output_dir=diag_dir)
-        if run_diag:
-            run_diagnostics(sim, output_dir=diag_dir)
-    else:
+        
+        # RUN SIMULATION
+        print("\n" + "=" * 70)
+        print("  RUNNING SIMULATION...")
+        print("=" * 70)
+        results = sim.run(run_diag=run_diag, diag_output_dir=diag_dir)
+        
+        # POST-SIMULATION MENU
+        print("\n" + "=" * 70)
+        print("  SIMULATION COMPLETE")
+        print("=" * 70)
+        
         while True:
-            fmt = input("\nOutput format? [gif/mp4/both] (default: both): ").strip().lower()
-            if fmt in ("", "both"):
-                fmt = "both"
-                break
-            elif fmt in ("gif", "mp4"):
-                break
-            print("  Please enter gif, mp4, or both.")
-        animate(sim,format = fmt)
+            print("\n  What would you like to do?")
+            print("    [1] Run animation sweep")
+            print("    [2] Run another simulation")
+            print("    [3] Exit")
+            
+            post_choice = input("\n  Select option [1/2/3]: ").strip()
+            
+            if post_choice == "1":
+                # ANIMATION
+                while True:
+                    fmt = input("\n  Output format? [gif/mp4/both] (default: both): ").strip().lower()
+                    if fmt in ("", "both"):
+                        fmt = "both"
+                        break
+                    elif fmt in ("gif", "mp4"):
+                        break
+                    print("    Please enter gif, mp4, or both.")
+                
+                animate(sim, format=fmt)
+                continue
+            
+            elif post_choice == "2":
+                # Another simulation
+                break  # back to simulation setup
+            
+            elif post_choice == "3":
+                # Exit
+                print("\n" + "=" * 70)
+                print("  Thank you for using MD Engine!")
+                print("=" * 70 + "\n")
+                return
+            
+            else:
+                print("    Invalid choice. Please enter 1, 2, or 3.")
+
+
+if __name__ == "__main__":
+    main()
