@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from multiprocessing import Pool
-from scipy.constants import k as k_B          # Boltzmann constant in J/K
+from scipy.constants import k as k_B
 import os
 
 
@@ -11,7 +11,7 @@ def prompt(label, default, cast=float):
     return cast(val) if val else cast(default)
 
 
-# ================================================================== INERT GAS DATABASE
+# INERT GAS DATABASE
 
 INERT_GASES = {
     "Ar": {
@@ -65,10 +65,9 @@ class MDSimulation:
 
         self.sigma            = sigma
         self.eps              = eps
-        self.eps_kb           = eps*(1.603e-19 / k_B )         # ε/k_B in Kelvin
+        self.eps_kb           = eps*(1.603e-19 / k_B )
         self.n_cells          = n_cells
         
-        # Handle rho_star vs cell_param_a
         if cell_param_a is not None:
             # Derive rho_star from cell_param_a
             L = cell_param_a * n_cells
@@ -92,8 +91,7 @@ class MDSimulation:
         self.rdf_interval     = rdf_interval
         self.rdf_bins         = rdf_bins
         self.plot_rdf         = plot_rdf
-
-        # T* sweep (reduced temperatures)
+        
         self.t_star_values = (t_star_values
                               if t_star_values is not None
                               else [0.01, 0.2, 0.4, 0.6, 0.8, 1.0])
@@ -104,7 +102,7 @@ class MDSimulation:
             self.n_workers = min(n_tasks, cpu_count)
         else:
             self.n_workers = n_workers
-
+        
         self.animate_equil_steps    = animate_equil_steps
         self.animate_prod_steps     = animate_prod_steps
         self.animate_frame_skip     = animate_frame_skip
@@ -112,11 +110,9 @@ class MDSimulation:
                                        if animate_t_star_values is not None
                                        else self.t_star_values)
 
-        # Diagnostics arrays — populated from parallel worker results
-        # keyed by T_star after run() completes
-        self.diagnostics = {}   # T_star -> dict with kin_E, pot_E, tot_E, P
+        self.diagnostics = {}
 
-    # ------------------------------------------------------------------ constructors
+    # CONSTRUCTORS
     @classmethod
     def with_defaults(cls):
         print("\n[Using default parameters]")
@@ -186,10 +182,9 @@ class MDSimulation:
             n_workers=n_workers,
         )
 
-    # ------------------------------------------------------------------ helpers for input and display
+    # INPUT AND DISPLAY UTILITIES
     @staticmethod
     def display_inert_gas_table():
-        """Display available inert gases in a nice table."""
         print("\n" + "=" * 70)
         print("  INERT GAS DATABASE  (Lennard-Jones Parameters)")
         print("=" * 70)
@@ -202,7 +197,6 @@ class MDSimulation:
 
     @staticmethod
     def select_inert_gas():
-        """Interactive selection of inert gas from database."""
         MDSimulation.display_inert_gas_table()
         
         while True:
@@ -222,7 +216,7 @@ class MDSimulation:
                 print("  Invalid choice. Please enter Ar, Kr, Xe, Ne, or custom.")
 
 
-    # ------------------------------------------------------------------ physics and simulation methods
+    # PHYSICS AND SIMULATION METHODS
     def lj_properties(self, r_sq):
         rc_sq   = self.r_cutoff_sq
         inv_rc2 = 1.0 / rc_sq
@@ -294,13 +288,9 @@ class MDSimulation:
         return np.max(np.sum(
             self.minimum_image(pos, pos_ref, L) ** 2, axis=1)) > self.thresh_sq
 
-    # ------------------------------------------------------------------ run (parallel)
+    # PARALLEL SIMULATION
     @staticmethod
     def _run_one_temperature(args):
-        """
-        Run equilibration + production for a single T* and return the averaged g(r)
-        plus full per-step energy and momentum traces for diagnostics.
-        """
         (T_star, pos0, L, sigma, eps_kb,
         dt, r_cutoff, r_skin,
         equil_steps, prod_steps,
@@ -314,8 +304,6 @@ class MDSimulation:
         thresh_sq   = (0.5 * (r_skin - r_cutoff)) ** 2
         r_max       = L / 2.0
         dr_bin      = r_max / rdf_bins
-
-        # ---- local physics helpers ----
 
         def minimum_image(p1, p2):
             dr = p1 - p2
@@ -351,7 +339,7 @@ class MDSimulation:
             dist_sq = np.sum(dr ** 2, axis=2)
             ii, jj  = np.where(np.triu(dist_sq < r_skin_sq, k=1))
             return np.stack((ii, jj), axis=1)
-
+        
         def verlet_step(pos, vel, f, nb):
             pos_new = (pos + vel * dt + 0.5 * f * dt ** 2) % L
             v_mid   = vel + 0.5 * f * dt
@@ -373,7 +361,6 @@ class MDSimulation:
             c = (edges[:-1] + edges[1:]) / 2.0
             return c, (2.0 * hist * L ** 3) / (len(pos) ** 2 * 4 * np.pi * c ** 2 * dr_bin)
 
-        # ---- simulation ----
         pos     = pos0.copy()
         pos_ref = pos.copy()
         N       = len(pos)
@@ -385,13 +372,12 @@ class MDSimulation:
 
         total_steps = equil_steps + prod_steps
 
-        # Diagnostic arrays — one entry per step over the full run
         kin_E_trace = np.zeros(total_steps)
         pot_E_trace = np.zeros(total_steps)
         tot_E_trace = np.zeros(total_steps)
-        P_trace     = np.zeros((total_steps, 3))   # total momentum per step
+        P_trace     = np.zeros((total_steps, 3))
 
-        T_K = T_star * eps_kb          # for printing only
+        T_K = T_star * eps_kb
         print(f"  [T* = {T_star:.3f} | T = {T_K:.2f} K]  equilibrating ({equil_steps} steps)...",
             flush=True)
 
@@ -402,13 +388,12 @@ class MDSimulation:
                 pos_ref = pos.copy()
             if step % rescale_interval == 0:
                 vel = rescale_velocities(vel, T_star)
-
-            # --- record diagnostics ---
+            
             ke = 0.5 * np.sum(vel ** 2)
             kin_E_trace[step] = ke
             pot_E_trace[step] = pe
             tot_E_trace[step] = ke + pe
-            P_trace[step]     = vel.sum(axis=0)   # total momentum (reduced units)
+            P_trace[step]     = vel.sum(axis=0)
 
         print(f"  [T* = {T_star:.3f}]  production ({prod_steps} steps)...", flush=True)
         g_acc = np.zeros(rdf_bins)
@@ -421,8 +406,7 @@ class MDSimulation:
             if needs_rebuild(pos, pos_ref):
                 nb_list = update_neighbor_list(pos)
                 pos_ref = pos.copy()
-
-            # --- record diagnostics ---
+            
             ke = 0.5 * np.sum(vel ** 2)
             kin_E_trace[global_step] = ke
             pot_E_trace[global_step] = pe
@@ -434,7 +418,7 @@ class MDSimulation:
                 g_acc += g_curr
                 count += 1
 
-        g_avg  = g_acc / count
+        g_avg = g_acc / count
         
         diag = {
             "kin_E": kin_E_trace,
@@ -457,24 +441,20 @@ class MDSimulation:
         print(f"Equivalent T (K): {[round(t * self.eps_kb, 3) for t in self.t_star_values]}")
         print(f"Launching {len(self.t_star_values)} workers (n_workers={self.n_workers})...\n")
 
-        # Build argument tuples for each temperature (one per worker process)
         worker_args = [
             (T_star, pos0, L, self.sigma, self.eps_kb,
              self.dt, self.r_cutoff, self.r_skin,
              self.equil_steps, self.prod_steps,
              self.rescale_interval, self.rdf_interval, self.rdf_bins,
-             idx)                                   # seed = index for reproducibility
+             idx)
             for idx, T_star in enumerate(self.t_star_values)
         ]
 
         with Pool(processes=self.n_workers) as pool:
             results = pool.map(MDSimulation._run_one_temperature, worker_args)
 
-        # results is a list of (T_star, r_centers, g_avg, diag)
-        # sort by T* so the legend is ordered
         results.sort(key=lambda x: x[0])
-
-        # Store diagnostics on self, keyed by T_star
+        
         for T_star, r_centers, g_avg, diag in results:
             self.diagnostics[T_star] = diag
 
@@ -507,42 +487,24 @@ class MDSimulation:
         print(f"\nComplete. Plot saved as '{output_file}'")
 
 
-# ================================================================== PHASE CLASSIFICATION
+# PHASE CLASSIFICATION
 
 def _classify_phase(g_avg, r_centers):
-    """
-    Classify phase by examining convergence of g(r) to 1 at large distances.
-    Tolerates ±0.03 deviation from 1.0
-    
-    Parameters:
-      g_avg: array of g(r) values
-      r_centers: array of corresponding r values
-    
-    Returns:
-      "SOLID", "LIQUID", or "GAS"
-    """
-    # Look at the end (large r) region, e.g., last 10% of data
+    g_max = np.max(g_avg)
     n_tail = max(1, len(g_avg) // 10)
     g_tail = g_avg[-n_tail:]
-    
     g_tail_mean = float(np.mean(g_tail))
-    # Check convergence: how close to 1.0?
     deviation = abs(g_tail_mean - 1.0)
     
-    if deviation < 0.03:
+    if deviation < 0.03 and g_max < 3.5:
         return "LIQUID"
     else:
         return "SOLID"
 
 
-# ================================================================== DIAGNOSTICS
+# DIAGNOSTICS
 
 def run_diagnostics(sim, output_dir="diagnostics"):
-    """
-    Plot and save energy + momentum diagnostics for every temperature that was run.
-    Each temperature gets its own pair of PDF files saved under `output_dir/`.
-    A console summary (mean energy, fluctuation, max momentum) is printed for each T*.
-    """
     if not sim.diagnostics:
         print("[Diagnostics] No data available. Run the simulation first.")
         return
@@ -567,7 +529,6 @@ def run_diagnostics(sim, output_dir="diagnostics"):
         tot_E = diag["tot_E"]
         P     = diag["P"]
 
-        # ---- Energy plot ----
         fig_e, ax_e = plt.subplots(figsize=(10, 5))
         ax_e.plot(steps_arr, kin_E, label="Kinetic Energy",   color="blue",  alpha=0.6)
         ax_e.plot(steps_arr, pot_E, label="Potential Energy", color="green", alpha=0.6)
@@ -583,7 +544,6 @@ def run_diagnostics(sim, output_dir="diagnostics"):
         fig_e.savefig(energy_file, dpi=150)
         plt.close(fig_e)
 
-        # ---- Momentum plot ----
         fig_p, ax_p = plt.subplots(figsize=(10, 4))
         P_mag = np.linalg.norm(P, axis=1)
         ax_p.plot(steps_arr, P_mag, label="|P| total", color="black", linewidth=1.5)
@@ -598,7 +558,6 @@ def run_diagnostics(sim, output_dir="diagnostics"):
         fig_p.savefig(momentum_file, dpi=150)
         plt.close(fig_p)
 
-        # ---- Console summary ----
         prod_E   = tot_E[sim.equil_steps:]
         E_mean   = float(np.mean(prod_E))
         E_fluc   = float(np.std(prod_E))
@@ -618,8 +577,9 @@ def run_diagnostics(sim, output_dir="diagnostics"):
     print("Done running diagnostics.\n")
 
 
-def animate(sim, output_file="md_engine",format = "both"):
+# ANIMATION
 
+def animate(sim, output_file="md_engine",format = "both"):
     gif_file = output_file + ".gif"
     mp4_file = output_file + ".mp4"
 
@@ -638,7 +598,7 @@ def animate(sim, output_file="md_engine",format = "both"):
     t_star_list = sim.animate_t_star_values
     print(f"\nAnimation  —  {len(t_star_list)} temperatures, "
           f"{total_eq} equil + {total_pr} prod steps, frame skip={skip}")
-
+    
     pos     = pos0.copy()
     pos_ref = pos.copy()
     T_star  = t_star_list[0]
@@ -774,8 +734,7 @@ def animate(sim, output_file="md_engine",format = "both"):
             print(f"  ✓ GIF saved: '{gif_file}'")
         except Exception as e:
             print(f"  ✗ GIF failed: {e}")
-
-# ---- MP4 ----
+    
     if format in ("mp4", "both"):
         print(f"Saving MP4  → '{mp4_file}' ({total_frames} frames) ...")
         try:
@@ -800,16 +759,9 @@ def animate(sim, output_file="md_engine",format = "both"):
         pass
 
 
-# ================================================================== MAIN WORKFLOW
+# MAIN WORKFLOW
 
 def main():
-    """
-    Improved main workflow:
-    1. Run simulation
-    2. Ask if user wants to animate
-    3. Ask if user wants to run another simulation
-    """
-    
     print("\n" + "=" * 70)
     print("   LENNARD-JONES MD SIMULATION — RDF ANALYSIS")
     print("=" * 70)
@@ -819,14 +771,13 @@ def main():
         print("  NEW SIMULATION")
         print("-" * 70)
         
-        # Get user parameters
+
         default = input("\nUse default parameters? [y/n] (default: y): ").strip().lower()
         if default in ("", "y", "yes"):
             sim = MDSimulation.with_defaults()
         else:
             sim = MDSimulation.from_user_input()
         
-        # Ask whether to run diagnostics
         print("\n--- Post-simulation analysis ---")
         diag_choice = input("Run diagnostics after simulation? [y/n] (default: y): ").strip().lower()
         run_diag = diag_choice in ("", "y", "yes")
@@ -836,13 +787,11 @@ def main():
             raw_dir = input(f"  Diagnostics output folder [diagnostics]: ").strip()
             diag_dir = raw_dir if raw_dir else "diagnostics"
         
-        # RUN SIMULATION
         print("\n" + "=" * 70)
         print("  RUNNING SIMULATION...")
         print("=" * 70)
         results = sim.run(run_diag=run_diag, diag_output_dir=diag_dir)
         
-        # POST-SIMULATION MENU
         print("\n" + "=" * 70)
         print("  SIMULATION COMPLETE")
         print("=" * 70)
@@ -856,7 +805,6 @@ def main():
             post_choice = input("\n  Select option [1/2/3]: ").strip()
             
             if post_choice == "1":
-                # ANIMATION
                 while True:
                     fmt = input("\n  Output format? [gif/mp4/both] (default: both): ").strip().lower()
                     if fmt in ("", "both"):
@@ -870,11 +818,9 @@ def main():
                 continue
             
             elif post_choice == "2":
-                # Another simulation
-                break  # back to simulation setup
+                break
             
             elif post_choice == "3":
-                # Exit
                 print("\n" + "=" * 70)
                 print("  Thank you for using MD Engine!")
                 print("=" * 70 + "\n")
