@@ -35,7 +35,6 @@ class SimulationConfig:
     rdf_bins:         int         = 200
 
     # Analysis
-    plot_rdf:         bool        = True
     t_star_values:    list        = field(default_factory=lambda: [0.01, 0.2, 0.4, 0.6, 0.8, 1.0])
     n_workers:        Optional[int] = field(default=None)
 
@@ -138,7 +137,6 @@ class CLI:
         rescale_interval = cls.prompt("velocity rescale every N steps", 10, int)
         rdf_interval     = cls.prompt("RDF sample every N steps", 10, int)
         rdf_bins         = cls.prompt("RDF histogram bins", 200, int)
-        plot_rdf         = bool(cls.prompt("plot RDF? (1=yes, 0=no)", 1, int))
 
         print("\n--- Temperature sweep (T* = reduced temperature) ---")
         raw           = input("  T* values space-separated [0.01 0.2 0.4 0.6 0.8 1.0]: ").strip()
@@ -167,7 +165,6 @@ class CLI:
             rescale_interval = rescale_interval,
             rdf_interval     = rdf_interval,
             rdf_bins         = rdf_bins,
-            plot_rdf         = plot_rdf,
             t_star_values    = t_star_values,
             n_workers        = n_workers,
             animate_equil_steps = animate_equil_steps,
@@ -191,11 +188,12 @@ class MDSimulation:
         # System setup
         self.n_cells = config.n_cells
         if config.cell_param_a is not None:
-            L             = config.cell_param_a * config.n_cells
-            self.rho_star = 4 * config.n_cells ** 3 / (L ** 3)
-            self.cell_param_a = config.cell_param_a
-            print(f"  Cell parameter a = {config.cell_param_a:.4f} σ")
-            print(f"  Derived ρ* = {self.rho_star:.4f}")
+            L                   = config.cell_param_a * config.n_cells
+            self.rho_star       = 4 * config.n_cells ** 3 / (L ** 3)
+            self.cell_param_a   = config.cell_param_a
+
+            print(f"\n    Cell parameter a = {config.cell_param_a:.4f} σ")
+            print(f"    Derived ρ* = {self.rho_star:.4f}")
         else:
             self.rho_star     = config.rho_star
             self.cell_param_a = None
@@ -214,7 +212,6 @@ class MDSimulation:
         self.rescale_interval = config.rescale_interval
         self.rdf_interval     = config.rdf_interval
         self.rdf_bins         = config.rdf_bins
-        self.plot_rdf         = config.plot_rdf
 
         # Temperature sweep
         self.t_star_values = config.t_star_values or [0.01, 0.2, 0.4, 0.6, 0.8, 1.0]
@@ -332,20 +329,67 @@ class MDSimulation:
         return c, (2.0 * hist * L ** 3) / (N ** 2 * 4 * np.pi * c ** 2 * dr_bin)
 
     @staticmethod
+    def _calculate_msd(current_pos_unwrapped, initial_pos):
+        dist = current_pos_unwrapped - initial_pos
+        total_displacement = np.sum(dist ** 2, axis=1)
+        return np.mean(total_displacement)
+
+    @staticmethod
+    def _calculate_diffusion_coefficient(msd, time_step):
+        """Estimate diffusion coefficient from MSD vs time using Einstein relation."""
+        n = len(msd)
+        if n < 2 or len(time_step) != n:
+            return 0.0, 0.0, 0.0
+        
+        start_frac = 0.30
+        end_frac = 1.0
+
+        start_idx = int(np.floor(start_frac * n))
+        end_idx = int(np.ceil(end_frac * n))
+
+        x = time_step[start_idx:end_idx]
+        y = msd[start_idx:end_idx]
+
+        if len(x) < 2:
+            return 0.0, 0.0, 0.0
+
+        slope, intercept = np.polyfit(x, y, 1)
+        D = slope / 6.0
+
+        return slope, intercept, D
+
+    @staticmethod
     def _needs_rebuild(pos, pos_ref, L, thresh_sq):
         """Return True if any atom has drifted beyond the rebuild threshold."""
         return np.max(np.sum(
             MDSimulation._apply_minimum_image(pos, pos_ref, L) ** 2, axis=1)) > thresh_sq
 
     @staticmethod
-    def _classify_phase(g_avg, r_centers):
-        """Heuristic phase classification from g(r) shape. Will be improved."""
-        g_max       = np.max(g_avg)
-        n_tail      = max(1, len(g_avg) // 10)
-        deviation   = abs(float(np.mean(g_avg[-n_tail:])) - 1.0)
-        if deviation < 0.03 and g_max < 3.5:
-            return "LIQUID"
-        return "SOLID"
+    def _classify_phase(g_avg, D=None, msd=None):
+        g_max = np.max(g_avg)
+        n_tail = max(1, len(g_avg) // 10)
+        tail_dev = abs(float(np.mean(g_avg[-n_tail:])) - 1.0)
+
+        # Structural evidence
+        structural = "SOLID" if (g_max > 3.5 or tail_dev >= 0.03) else "LIQUID"
+
+        # Transport evidence (if available)
+        if D is not None and msd is not None:
+            msd_growth = (msd[-1] - msd[0]) / max(msd[-1], 1e-10)
+            if msd_growth < 0.05:
+                transport = "SOLID"
+            elif D > 1e-3:       # tune this threshold for your σ/τ units
+                transport = "LIQUID"
+            else:
+                transport = structural  # fallback
+
+            # Require agreement, or flag ambiguity
+            if structural == transport:
+                return structural
+            else:
+                return f"{transport}?"   # near transition — flag it
+
+        return structural
 
     # DATACLASSES
 
@@ -376,9 +420,10 @@ class MDSimulation:
         momentum:    np.ndarray
         equil_steps: int
         prod_steps:  int
+        msd:         Optional[np.ndarray] = None
+        time_step:   Optional[np.ndarray] = None
 
     # PARALLEL WORKER
-
     @staticmethod
     def _run_one_temperature(args: 'MDSimulation.WorkerArgs') -> 'MDSimulation.SimulationResult':
 
@@ -395,8 +440,8 @@ class MDSimulation:
         vel      = rng.standard_normal((N, 3))
         vel     -= vel.mean(axis=0)
         vel      = MDSimulation._rescale_velocities(vel, args.T_star)
-        nb_list  = MDSimulation._update_neighbor_list(pos, args.L, r_skin_sq)
-        _, force = MDSimulation._calculate_forces(pos, nb_list, args.L, r_cutoff_sq)
+        neighbor_list  = MDSimulation._update_neighbor_list(pos, args.L, r_skin_sq)
+        _, force = MDSimulation._calculate_forces(pos, neighbor_list, args.L, r_cutoff_sq)
 
         total_steps = args.equil_steps + args.prod_steps
         kin_E_trace = np.zeros(total_steps)
@@ -409,10 +454,10 @@ class MDSimulation:
               f"equilibrating ({args.equil_steps} steps)...", flush=True)
 
         for step in range(args.equil_steps):
-            pos, vel, pe, force = MDSimulation._verlet_step(
-                pos, vel, force, args.dt, args.L, nb_list, r_cutoff_sq)
+            pos, vel, pe, force = MDSimulation._verlet_step(pos, vel, force, args.dt, args.L, neighbor_list, r_cutoff_sq)
+            
             if MDSimulation._needs_rebuild(pos, pos_ref, args.L, thresh_sq):
-                nb_list = MDSimulation._update_neighbor_list(pos, args.L, r_skin_sq)
+                neighbor_list = MDSimulation._update_neighbor_list(pos, args.L, r_skin_sq)
                 pos_ref = pos.copy()
             if step % args.rescale_interval == 0:
                 vel = MDSimulation._rescale_velocities(vel, args.T_star)
@@ -424,44 +469,55 @@ class MDSimulation:
 
         print(f"  [T* = {args.T_star:.3f}]  production ({args.prod_steps} steps)...", flush=True)
 
-        g_acc     = np.zeros(args.rdf_bins)
+        g_average_accumulation = np.zeros(args.rdf_bins)
         count     = 0
         r_centers = None
+        initial_pos_unwrapped  = pos.copy()
+        pos_unwrapped          = pos.copy()
+        msd                    = []
+        time_step              = []
 
         for step in range(args.prod_steps):
             global_step = args.equil_steps + step
-            pos, vel, pe, force = MDSimulation._verlet_step(
-                pos, vel, force, args.dt, args.L, nb_list, r_cutoff_sq)
+            old_pos = pos.copy()
+            pos, vel, pe, force = MDSimulation._verlet_step(pos, vel, force, args.dt, args.L, neighbor_list, r_cutoff_sq)
+            pos_unwrapped += MDSimulation._apply_minimum_image(pos, old_pos, args.L)
+
             if MDSimulation._needs_rebuild(pos, pos_ref, args.L, thresh_sq):
-                nb_list = MDSimulation._update_neighbor_list(pos, args.L, r_skin_sq)
+                neighbor_list = MDSimulation._update_neighbor_list(pos, args.L, r_skin_sq)
                 pos_ref = pos.copy()
+
             ke                       = 0.5 * np.sum(vel ** 2)
             kin_E_trace[global_step] = ke
             pot_E_trace[global_step] = pe
             tot_E_trace[global_step] = ke + pe
             mom_trace[global_step]   = vel.sum(axis=0)
+        
             if step % args.rdf_interval == 0:
-                r_centers, g_curr = MDSimulation._calculate_rdf(
-                    pos, args.L, dr_bin, args.rdf_bins, r_max)
-                g_acc += g_curr
+                r_centers, g_curr = MDSimulation._calculate_rdf(pos, args.L, dr_bin, args.rdf_bins, r_max)
+                msd.append(MDSimulation._calculate_msd(pos_unwrapped, initial_pos_unwrapped))
+                time_step.append(step * args.dt)
+                g_average_accumulation += g_curr
                 count += 1
 
         return MDSimulation.SimulationResult(
             T_star      = args.T_star,
             T_kelvin    = T_K,
             r_centers   = r_centers,
-            g_avg       = g_acc / count,
+            g_avg       = g_average_accumulation / count,
             kin_E       = kin_E_trace,
             pot_E       = pot_E_trace,
             tot_E       = tot_E_trace,
             momentum    = mom_trace,
             equil_steps = args.equil_steps,
             prod_steps  = args.prod_steps,
+            msd         = np.array(msd) if msd else None,
+            time_step   = np.array(time_step) if time_step else None,
         )
 
     # ORCHESTRATION
 
-    def run(self, output_file="melting_rdf.pdf", run_diag=True, diag_output_dir="diagnostics"):
+    def run(self, output_file="rdf_plot.pdf", run_diag=True, diag_output_dir="diagnostics", plot_rdf=True, plot_msd=True):
         """Run the full parallel temperature sweep and collect results."""
         pos0, L = self._generate_fcc_lattice(self.n_cells, self.rho_star)
         N       = len(pos0)
@@ -497,8 +553,10 @@ class MDSimulation:
         for result in results:
             self.simulation_results[result.T_star] = result
 
-        if self.plot_rdf:
+        if plot_rdf:
             self.plot_radial_distribution_function(output_file, results)
+        if plot_msd:
+            self.plot_msd(output_file="msd_plot.pdf")
         if run_diag:
             self.run_diagnostics(output_dir=diag_output_dir)
 
@@ -510,7 +568,8 @@ class MDSimulation:
         """Plot g(r) for all temperatures on a single figure."""
         plt.figure(figsize=(10, 6))
         for result in results:
-            phase = self._classify_phase(result.g_avg, result.r_centers)
+            _,_, D = self._calculate_diffusion_coefficient(result.msd, result.time_step)
+            phase = self._classify_phase(result.g_avg, D, result.msd)
             plt.plot(
                 result.r_centers * self.sigma,
                 result.g_avg,
@@ -528,8 +587,29 @@ class MDSimulation:
         plt.show()
         print(f"\nComplete. Plot saved as '{output_file}'")
 
-    # DIAGNOSTICS
+    def plot_msd(self, output_file="msd_plot.pdf"):
+        """Plot mean squared displacement (MSD) vs time for all temperatures."""
+        plt.figure(figsize=(10, 6))
 
+        for T_star, result in self.simulation_results.items():
+
+            plt.plot(result.time_step, result.msd, label=f"T* = {T_star:.3f}  ({result.T_kelvin:.1f} K)")
+            slope, intercept, D = self._calculate_diffusion_coefficient(result.msd, result.time_step)
+            plt.plot(result.time_step, slope * result.time_step + intercept, linestyle="--", alpha=0.5, label=f"Fit T*={T_star:.3f}, D={D:.4e} σ²/τ")
+            print(f"  T* = {T_star:.3f}  T = {result.T_kelvin:.2f} K  →  D ≈ {D:.4e} σ²/τ")
+
+        plt.title("Mean Squared Displacement (MSD) vs Time")
+        plt.xlabel("Time (reduced units)")
+        plt.ylabel("MSD (σ²)")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(output_file, dpi=150)
+        plt.show()
+        print(f"\nComplete. MSD plot saved as '{output_file}'")
+
+        
+    # DIAGNOSTICS
     def run_diagnostics(self, output_dir="diagnostics"):
         """Save energy and momentum conservation plots for every temperature."""
         if not self.simulation_results:
@@ -797,6 +877,10 @@ def main():
         print("\n--- Post-simulation analysis ---")
         run_diag = input("Run diagnostics after simulation? [y/n] (default: y): ").strip().lower()
         run_diag = run_diag in ("", "y", "yes")
+        plot_rdf = input("Plot RDF after simulation? [y/n] (default: y): ").strip().lower()
+        plot_rdf = plot_rdf in ("", "y", "yes")
+        plot_msd = input("Plot MSD after simulation? [y/n] (default: y): ").strip().lower()
+        plot_msd = plot_msd in ("", "y", "yes")
 
         diag_dir = "diagnostics"
         if run_diag:
@@ -806,7 +890,7 @@ def main():
         print("\n" + "=" * 70)
         print("  RUNNING SIMULATION...")
         print("=" * 70)
-        sim.run(run_diag=run_diag, diag_output_dir=diag_dir)
+        sim.run(run_diag=run_diag, diag_output_dir=diag_dir, plot_rdf=plot_rdf, plot_msd=plot_msd)
 
         print("\n" + "=" * 70)
         print("  SIMULATION COMPLETE")
