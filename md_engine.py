@@ -371,14 +371,11 @@ class MDSimulation:
         tail_dev = abs(float(np.mean(g_avg[-n_tail:])) - 1.0)
 
         # Structural evidence
-        structural = "SOLID" if (g_max > 3.5 or tail_dev >= 0.03) else "LIQUID"
+        structural = "SOLID" if (g_max > 3.5 or tail_dev >= 0.05) else "LIQUID"
 
         # Transport evidence (if available)
         if D is not None and msd is not None:
-            msd_growth = (msd[-1] - msd[0]) / max(msd[-1], 1e-10)
-            if msd_growth < 0.05:
-                transport = "SOLID"
-            elif D > 1e-3:       # tune this threshold for your σ/τ units
+            if D > 1e-2:     
                 transport = "LIQUID"
             else:
                 transport = structural  # fallback
@@ -387,7 +384,7 @@ class MDSimulation:
             if structural == transport:
                 return structural
             else:
-                return f"{transport}?"   # near transition — flag it
+                return f"{transport}?"   # near transition, flag it
 
         return structural
 
@@ -593,9 +590,11 @@ class MDSimulation:
 
         for T_star, result in self.simulation_results.items():
 
-            plt.plot(result.time_step, result.msd, label=f"T* = {T_star:.3f}  ({result.T_kelvin:.1f} K)")
             slope, intercept, D = self._calculate_diffusion_coefficient(result.msd, result.time_step)
-            plt.plot(result.time_step, slope * result.time_step + intercept, linestyle="--", alpha=0.5, label=f"Fit T*={T_star:.3f}, D={D:.4e} σ²/τ")
+            phase = self._classify_phase(result.g_avg, D, result.msd)
+            plt.plot(result.time_step, result.msd, label=f"T* = {T_star:.3f}  ({result.T_kelvin:.1f} K)  {phase}")
+            if phase != "SOLID":
+                plt.plot(result.time_step, slope * result.time_step + intercept, linestyle="--", alpha=0.5, label=f"Fit T*={T_star:.3f}, D={D:.4e} σ²/τ")
             print(f"  T* = {T_star:.3f}  T = {result.T_kelvin:.2f} K  →  D ≈ {D:.4e} σ²/τ")
 
         plt.title("Mean Squared Displacement (MSD) vs Time")
@@ -677,13 +676,12 @@ class MDSimulation:
         print(f"\n{'='*60}")
         print("Done running diagnostics.\n")
 
-    # ANIMATION
-
+    # ANI   MATION
     def animate(self, output_file="md_engine", format="both"):
         """Run a sequential heating sweep and save an animated visualisation."""
         gif_file = output_file + ".gif"
         mp4_file = output_file + ".mp4"
-
+ 
         pos0, L  = self._generate_fcc_lattice(self.n_cells, self.rho_star)
         N        = len(pos0)
         r_max    = L / 2.0
@@ -691,29 +689,31 @@ class MDSimulation:
         skip     = self.animate_frame_skip
         total_eq = self.animate_equil_steps
         total_pr = self.animate_prod_steps
-
+ 
+        # Each entry: (T_star, T_K, r_centers, g_avg, msd_arr, time_arr)
         frames        = []
         finished_rdfs = []
         all_speeds    = []
         t_star_list   = self.animate_t_star_values
-
+ 
         print(f"\nAnimation  —  {len(t_star_list)} temperatures, "
               f"{total_eq} equil + {total_pr} prod steps, frame skip={skip}")
-
-        rng     = np.random.default_rng(42)
-        pos     = pos0.copy()
-        pos_ref = pos.copy()
-        vel     = rng.standard_normal((N, 3))
-        vel    -= vel.mean(axis=0)
-        vel     = self._rescale_velocities(vel, t_star_list[0])
-        nb_list = self._update_neighbor_list(pos, L, self.r_skin_sq)
+ 
+        rng      = np.random.default_rng(42)
+        pos      = pos0.copy()
+        pos_ref  = pos.copy()
+        vel      = rng.standard_normal((N, 3))
+        vel     -= vel.mean(axis=0)
+        vel      = self._rescale_velocities(vel, t_star_list[0])
+        nb_list  = self._update_neighbor_list(pos, L, self.r_skin_sq)
         _, force = self._calculate_forces(pos, nb_list, L, self.r_cutoff_sq)
-
+ 
         for T_star in t_star_list:
             T_K = T_star * self.eps_kb
             vel = self._rescale_velocities(vel, T_star)
             print(f"  T* = {T_star:.3f}  (T = {T_K:.1f} K)  equilibrating...", end="", flush=True)
-
+ 
+            # ── Equilibration ────────────────────────────────────────────────
             for step in range(total_eq):
                 pos, vel, _, force = self._verlet_step(
                     pos, vel, force, self.dt, L, nb_list, self.r_cutoff_sq)
@@ -722,55 +722,82 @@ class MDSimulation:
                     pos_ref = pos.copy()
                 if step % self.rescale_interval == 0:
                     vel = self._rescale_velocities(vel, T_star)
-
+ 
             print(" recording...", end="", flush=True)
-            g_acc = np.zeros(self.rdf_bins)
-            count = 0
-
+ 
+            # ── Production ───────────────────────────────────────────────────
+            g_acc              = np.zeros(self.rdf_bins)
+            count              = 0
+            initial_pos_unwrap = pos.copy()
+            pos_unwrap         = pos.copy()
+            msd_list           = []
+            time_list          = []
+ 
             for step in range(total_pr):
+                old_pos = pos.copy()
                 pos, vel, _, force = self._verlet_step(
                     pos, vel, force, self.dt, L, nb_list, self.r_cutoff_sq)
+                # Unwrap via minimum-image displacement (mirrors _run_one_temperature)
+                pos_unwrap += self._apply_minimum_image(pos, old_pos, L)
+ 
                 if self._needs_rebuild(pos, pos_ref, L, self.thresh_sq):
                     nb_list = self._update_neighbor_list(pos, L, self.r_skin_sq)
                     pos_ref = pos.copy()
-
+ 
                 if step % skip == 0:
-                    speed               = np.sqrt(np.sum(vel ** 2, axis=1))
-                    r_centers, g_curr   = self._calculate_rdf(pos, L, dr_bin, self.rdf_bins, r_max)
-                    g_acc              += g_curr
-                    count              += 1
-                    g_running           = g_acc / count
+                    speed             = np.sqrt(np.sum(vel ** 2, axis=1))
+                    r_centers, g_curr = self._calculate_rdf(
+                        pos, L, dr_bin, self.rdf_bins, r_max)
+                    g_acc  += g_curr
+                    count  += 1
+                    g_running = g_acc / count
+ 
+                    msd_list.append(self._calculate_msd(pos_unwrap, initial_pos_unwrap))
+                    time_list.append(step * self.dt)
+ 
+                    msd_arr  = np.array(msd_list)
+                    time_arr = np.array(time_list)
+                    _, _, D  = self._calculate_diffusion_coefficient(msd_arr, time_arr)
+ 
                     all_speeds.append(speed)
-                    frames.append((pos[:, :2].copy(), speed, r_centers, g_running,
-                                   T_star, T_K, float(np.max(g_running))))
-
-            finished_rdfs.append((T_star, T_K, r_centers, g_acc / count))
+                    frames.append((
+                        pos[:, :2].copy(), speed,
+                        r_centers, g_running,
+                        T_star, T_K, float(np.max(g_running)),
+                        msd_arr, time_arr, D,
+                    ))
+ 
+            final_msd  = np.array(msd_list)
+            final_time = np.array(time_list)
+            _, _, D_final = self._calculate_diffusion_coefficient(final_msd, final_time)
+            finished_rdfs.append((T_star, T_K, r_centers,
+                                  g_acc / count, final_msd, final_time, D_final))
             print(f" {count} frames.")
-
+ 
         s_concat     = np.concatenate(all_speeds)
         s_min, s_max = float(np.percentile(s_concat, 2)), float(np.percentile(s_concat, 98))
         total_frames = len(frames)
         n_t          = len(t_star_list)
         print(f"\nTotal frames: {total_frames}.  Building figure...")
-
+ 
         fig = plt.figure(figsize=(11, 5.5), facecolor="#0d0d0d")
         fig.set_size_inches(11, 5.6)
         gs      = fig.add_gridspec(1, 2, wspace=0.3, left=0.05, right=0.97, top=0.80, bottom=0.13)
         ax_slab = fig.add_subplot(gs[0])
         ax_rdf  = fig.add_subplot(gs[1])
-
+ 
         for ax in (ax_slab, ax_rdf):
             ax.set_facecolor("#111111")
             ax.tick_params(colors="0.7")
             for sp in ax.spines.values():
                 sp.set_color("0.3")
-
+ 
         ax_slab.set_xlim(0, L);  ax_slab.set_ylim(0, L)
         ax_slab.set_aspect("equal")
         ax_slab.set_xlabel("x (σ)", color="0.7")
         ax_slab.set_ylabel("y (σ)", color="0.7")
         slab_title = ax_slab.set_title("", color="white", fontsize=11)
-
+ 
         init_xy, init_spd = frames[0][0], frames[0][1]
         sc   = ax_slab.scatter(init_xy[:, 0], init_xy[:, 1],
                                c=init_spd, cmap="plasma", vmin=s_min, vmax=s_max,
@@ -779,52 +806,57 @@ class MDSimulation:
         cbar.set_label("Speed |v| (σ/t*)", color="0.7", fontsize=8)
         cbar.ax.yaxis.set_tick_params(color="0.7")
         plt.setp(cbar.ax.yaxis.get_ticklabels(), color="0.7")
-
+ 
         ax_rdf.set_xlim(0, r_max * self.sigma)
         ax_rdf.set_ylim(0, 5.5)
         ax_rdf.set_xlabel("r  (Å)", color="0.7")
         ax_rdf.set_ylabel("g(r)", color="0.7")
         ax_rdf.axhline(1.0, color="0.4", ls="--", lw=0.8)
         rdf_title = ax_rdf.set_title("", color="white", fontsize=11)
-
+ 
         ghost_cmap      = plt.cm.cool
         live_line_rdf,  = ax_rdf.plot([], [], color="#ff6b35", lw=1.8, zorder=5)
-        ghost_lines_rdf = []
         ghost_handles   = []
         drawn_ghosts    = set()
         main_title      = fig.suptitle("", color="white", fontsize=14, y=0.96)
         info_text       = fig.text(0.5, 0.90, "", color="#a8dadc", fontsize=11, ha="center")
         phase_colors    = {"SOLID": "#3498db", "LIQUID": "#e74c3c", "GAS": "#2ecc71"}
-
+ 
         def update(fi):
-            atom_xy, speed, r_centers, g_running, T_star_f, T_K_f, peak_g = frames[fi]
-            phase = self._classify_phase(g_running, r_centers)
+            # Unpack the enriched frame tuple
+            atom_xy, speed, r_centers, g_running, T_star_f, T_K_f, peak_g, msd_arr, time_arr, D = frames[fi]
+ 
+            # Use _calculate_diffusion_coefficient + _classify_phase exactly as in run()
+            phase = self._classify_phase(g_running, D, msd_arr)
+ 
             sc.set_offsets(atom_xy)
             sc.set_array(speed)
             slab_title.set_text(f"Atoms (xy)  |  T* = {T_star_f:.3f}  ({T_K_f:.1f} K)")
-            for idx, (T_g, T_K_g, r_g, g_g) in enumerate(finished_rdfs):
+ 
+            # Draw ghost traces for fully completed temperatures
+            for idx, (T_g, T_K_g, r_g, g_g, msd_g, time_g, D_g) in enumerate(finished_rdfs):
                 if T_g < T_star_f and idx not in drawn_ghosts:
-                    col    = ghost_cmap(idx / max(n_t - 1, 1))
-                    phase_g = self._classify_phase(g_g, r_g)
+                    col     = ghost_cmap(idx / max(n_t - 1, 1))
+                    phase_g = self._classify_phase(g_g, D_g, msd_g)
                     gl, = ax_rdf.plot(r_g * self.sigma, g_g,
                                       color=col, lw=1.0, alpha=0.4,
                                       label=f"T*={T_g:.2f} ({phase_g})", zorder=2)
-                    ghost_lines_rdf.append(gl)
                     ghost_handles.append(gl)
                     drawn_ghosts.add(idx)
+ 
             live_line_rdf.set_data(r_centers * self.sigma, g_running)
             live_line_rdf.set_label(f"T*={T_star_f:.2f} (live)")
             rdf_title.set_text("g(r) running avg")
             ax_rdf.legend(handles=ghost_handles + [live_line_rdf],
                           loc="upper right", fontsize=7,
                           framealpha=0.2, labelcolor="white")
-            info_text.set_text(f"g(r) peak = {peak_g:.2f}")
+            info_text.set_text(f"g(r) peak = {peak_g:.2f}   D = {D:.4e} σ²/τ")
             main_title.set_text(f"Melting & Diffusion  |  PHASE: {phase}")
             main_title.set_color(phase_colors.get(phase, "white"))
             return (sc, live_line_rdf, slab_title, rdf_title, main_title, info_text)
-
+ 
         ani = FuncAnimation(fig, update, frames=total_frames, interval=60, blit=False)
-
+ 
         if format in ("gif", "both"):
             print(f"\nSaving GIF  → '{gif_file}' ({total_frames} frames) ...")
             try:
@@ -838,9 +870,8 @@ class MDSimulation:
             try:
                 from matplotlib.animation import FFMpegWriter
                 mp4_writer = FFMpegWriter(
-                    fps       = 20,
-                    codec     = "libx264",
-                    extra_args= [
+                    fps=20, codec="libx264",
+                    extra_args=[
                         "-pix_fmt", "yuv420p",
                         "-vf",      "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                         "-crf",     "18",
@@ -853,12 +884,11 @@ class MDSimulation:
                 print("  ✗ MP4 failed: FFmpeg not found — install FFmpeg or use format='gif'")
             except Exception as e:
                 print(f"  ✗ MP4 failed: {e}")
-
+ 
         try:
             plt.show()
         except Exception:
             pass
-
 
 # MAIN WORKFLOW
 def main():
