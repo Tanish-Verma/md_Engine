@@ -514,8 +514,14 @@ class MDSimulation:
 
     # ORCHESTRATION
 
-    def run(self, output_file="rdf_plot.pdf", run_diag=True, diag_output_dir="diagnostics", plot_rdf=True, plot_msd=True):
-        """Run the full parallel temperature sweep and collect results."""
+    def run(self, output_dir="output", run_diag=True, plot_rdf=True, plot_msd=True):
+        """Run the full parallel temperature sweep and collect results.
+
+        All generated plots and animations will be written under `output_dir`.
+        """
+        # Ensure output directory exists and remember it on the instance
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
         pos0, L = self._generate_fcc_lattice(self.n_cells, self.rho_star)
         N       = len(pos0)
         print(f"\nSystem: N = {N} atoms, L = {L:.4f} σ")
@@ -551,11 +557,11 @@ class MDSimulation:
             self.simulation_results[result.T_star] = result
 
         if plot_rdf:
-            self.plot_radial_distribution_function(output_file, results)
+            self.plot_radial_distribution_function("rdf_plot.pdf", results)
         if plot_msd:
-            self.plot_msd(output_file="msd_plot.pdf")
+            self.plot_msd("msd_plot.pdf")
         if run_diag:
-            self.run_diagnostics(output_dir=diag_output_dir)
+            self.run_diagnostics()
 
         return results
 
@@ -580,9 +586,11 @@ class MDSimulation:
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(output_file, dpi=150)
+        out_path = os.path.join(getattr(self, "output_dir", "output"), output_file)
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        plt.savefig(out_path, dpi=150)
         plt.show()
-        print(f"\nComplete. Plot saved as '{output_file}'")
+        print(f"\nComplete. Plot saved as '{out_path}'")
 
     def plot_msd(self, output_file="msd_plot.pdf"):
         """Plot mean squared displacement (MSD) vs time for all temperatures."""
@@ -603,19 +611,29 @@ class MDSimulation:
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(output_file, dpi=150)
+        out_path = os.path.join(getattr(self, "output_dir", "output"), output_file)
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        plt.savefig(out_path, dpi=150)
         plt.show()
-        print(f"\nComplete. MSD plot saved as '{output_file}'")
+        print(f"\nComplete. MSD plot saved as '{out_path}'")
 
         
     # DIAGNOSTICS
-    def run_diagnostics(self, output_dir="diagnostics"):
-        """Save energy and momentum conservation plots for every temperature."""
+    def run_diagnostics(self, output_dir=None):
+        """Save energy and momentum conservation plots for every temperature.
+
+        If `output_dir` is None the instance `self.output_dir` is used (or 'diagnostics').
+        """
         if not self.simulation_results:
             print("[Diagnostics] No data available. Run the simulation first.")
             return
 
-        os.makedirs(output_dir, exist_ok=True)
+        if output_dir is None:
+            base_out = getattr(self, "output_dir", "output")
+            out_dir = os.path.join(base_out, "diagnostics")
+        else:
+            out_dir = output_dir
+        os.makedirs(out_dir, exist_ok=True)
         first_result = next(iter(self.simulation_results.values()))
         N_atoms      = 4 * self.n_cells ** 3
         total_steps  = first_result.equil_steps + first_result.prod_steps
@@ -623,7 +641,7 @@ class MDSimulation:
 
         print(f"\n{'='*60}")
         print(f"  DIAGNOSTICS  —  {N_atoms} atoms, {len(self.simulation_results)} temperatures")
-        print(f"  Output directory: '{output_dir}/'")
+        print(f"  Output directory: '{out_dir}/'")
         print(f"{'='*60}")
 
         for T_star in sorted(self.simulation_results):
@@ -655,7 +673,7 @@ class MDSimulation:
             ax_p.grid(True, linestyle="--", alpha=0.5)
 
             fig.tight_layout()
-            combined_file = os.path.join(output_dir, f"diagnostics_{tag}.pdf")
+            combined_file = os.path.join(out_dir, f"diagnostics_{tag}.pdf")
             fig.savefig(combined_file, dpi=150)
             plt.close(fig)
 
@@ -677,10 +695,16 @@ class MDSimulation:
         print("Done running diagnostics.\n")
 
     # ANI   MATION
-    def animate(self, output_file="md_engine", format="both"):
-        """Run a sequential heating sweep and save an animated visualisation."""
-        gif_file = output_file + ".gif"
-        mp4_file = output_file + ".mp4"
+    def animate(self, output_file="md_engine", format="both", output_dir=None):
+        """Run a sequential heating sweep and save an animated visualisation.
+
+        Saved files (GIF/MP4) will be written into `output_dir` or the instance
+        `self.output_dir` if available.
+        """
+        out_dir = output_dir or getattr(self, "output_dir", "output")
+        os.makedirs(out_dir, exist_ok=True)
+        gif_file = os.path.join(out_dir, output_file + ".gif")
+        mp4_file = os.path.join(out_dir, output_file + ".mp4")
  
         pos0, L  = self._generate_fcc_lattice(self.n_cells, self.rho_star)
         N        = len(pos0)
@@ -912,15 +936,15 @@ def main():
         plot_msd = input("Plot MSD after simulation? [y/n] (default: y): ").strip().lower()
         plot_msd = plot_msd in ("", "y", "yes")
 
-        diag_dir = "diagnostics"
-        if run_diag:
-            raw_dir  = input("  Diagnostics output folder [diagnostics]: ").strip()
-            diag_dir = raw_dir if raw_dir else "diagnostics"
+        # Ask user where to write all outputs (plots, animations, diagnostics)
+        raw_out = input("  Output folder for all outputs [output]: ").strip()
+        out_dir = raw_out if raw_out else "output"
+        os.makedirs(out_dir, exist_ok=True)
 
         print("\n" + "=" * 70)
         print("  RUNNING SIMULATION...")
         print("=" * 70)
-        sim.run(run_diag=run_diag, diag_output_dir=diag_dir, plot_rdf=plot_rdf, plot_msd=plot_msd)
+        sim.run(output_dir=out_dir, run_diag=run_diag, plot_rdf=plot_rdf, plot_msd=plot_msd)
 
         print("\n" + "=" * 70)
         print("  SIMULATION COMPLETE")
