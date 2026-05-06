@@ -1,3 +1,6 @@
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend — must come before any other matplotlib imports
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -39,10 +42,10 @@ class SimulationConfig:
     n_workers:        Optional[int] = field(default=None)
 
     # Animation
-    animate_equil_steps:   int          = 2000
-    animate_prod_steps:    int          = 2000
-    animate_frame_skip:    int          = 10
-    animate_t_star_values: Optional[list] = field(default=None)
+    trajectory_interval: int      = 2
+    render_interval:   int        = 2
+    frames_per_T_star: int        = 200
+
 
 
 # CLI 
@@ -147,9 +150,9 @@ class CLI:
         n_workers = None if n_workers == 0 else n_workers
 
         print("\n--- Animation options ---")
-        animate_equil_steps = cls.prompt("animation equil steps per T*", 2000, int)
-        animate_prod_steps  = cls.prompt("animation production steps per T*", 2000, int)
-        animate_frame_skip  = cls.prompt("save every N-th frame", 10, int)
+        trajectory_interval = cls.prompt("record trajectory every N steps", 2, int)
+        render_interval     = cls.prompt("render MSD and RDF for every N*rdf_interval steps", 2, int)
+        frames_per_T_star   = cls.prompt("frames to capture per T*", 200, int)
 
         config = SimulationConfig(
             sigma            = sigma,
@@ -167,9 +170,9 @@ class CLI:
             rdf_bins         = rdf_bins,
             t_star_values    = t_star_values,
             n_workers        = n_workers,
-            animate_equil_steps = animate_equil_steps,
-            animate_prod_steps  = animate_prod_steps,
-            animate_frame_skip  = animate_frame_skip,
+            trajectory_interval = trajectory_interval,
+            render_interval     = render_interval,
+            frames_per_T_star   = frames_per_T_star,
         )
         return MDSimulation(config)
 
@@ -224,10 +227,9 @@ class MDSimulation:
             self.n_workers = config.n_workers
 
         # Animation parameters
-        self.animate_equil_steps    = config.animate_equil_steps
-        self.animate_prod_steps     = config.animate_prod_steps
-        self.animate_frame_skip     = config.animate_frame_skip
-        self.animate_t_star_values  = config.animate_t_star_values or self.t_star_values
+        self.trajectory_interval = config.trajectory_interval
+        self.render_interval     = config.render_interval
+        self.frames_per_T_star   = config.frames_per_T_star
 
         # Results storage
         self.simulation_results: dict = {}
@@ -292,7 +294,7 @@ class MDSimulation:
                  for iy in range(n_cells)
                  for iz in range(n_cells)
                  for b in basis]
-        return np.array(pos), L
+        return np.array(pos, dtype=np.float64), float(L)
 
     @staticmethod
     def _update_neighbor_list(pos, L, r_skin_sq):
@@ -417,8 +419,11 @@ class MDSimulation:
         momentum:    np.ndarray
         equil_steps: int
         prod_steps:  int
+        positions:   np.ndarray
+        velocities:  np.ndarray
         msd:         Optional[np.ndarray] = None
         time_step:   Optional[np.ndarray] = None
+        g_running_avg: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float32))
 
     # PARALLEL WORKER
     @staticmethod
@@ -473,10 +478,15 @@ class MDSimulation:
         pos_unwrapped          = pos.copy()
         msd                    = []
         time_step              = []
+        positions_recorded     = []
+        velocities_recorded    = []
+        g_running              = []
 
         for step in range(args.prod_steps):
             global_step = args.equil_steps + step
             old_pos = pos.copy()
+            positions_recorded.append(pos.astype(np.float32))
+            velocities_recorded.append(vel.astype(np.float32))
             pos, vel, pe, force = MDSimulation._verlet_step(pos, vel, force, args.dt, args.L, neighbor_list, r_cutoff_sq)
             pos_unwrapped += MDSimulation._apply_minimum_image(pos, old_pos, args.L)
 
@@ -495,7 +505,15 @@ class MDSimulation:
                 msd.append(MDSimulation._calculate_msd(pos_unwrapped, initial_pos_unwrapped))
                 time_step.append(step * args.dt)
                 g_average_accumulation += g_curr
+                g_running.append(g_curr.astype(np.float32))
                 count += 1
+
+        g_running_arr = np.array(g_running, dtype=np.float32)
+        if len(g_running_arr):
+            g_running_avg = np.cumsum(g_running_arr, axis=0, dtype=np.float32)
+            g_running_avg /= (np.arange(1, len(g_running_arr) + 1, dtype=np.float32)[:, None])
+        else:
+            g_running_avg = np.zeros((0, args.rdf_bins), dtype=np.float32)
 
         return MDSimulation.SimulationResult(
             T_star      = args.T_star,
@@ -510,16 +528,17 @@ class MDSimulation:
             prod_steps  = args.prod_steps,
             msd         = np.array(msd) if msd else None,
             time_step   = np.array(time_step) if time_step else None,
+            positions   = np.array(positions_recorded, dtype=np.float32),
+            velocities  = np.array(velocities_recorded, dtype=np.float32),
+            g_running_avg = g_running_avg
         )
 
     # ORCHESTRATION
-
     def run(self, output_dir="output", run_diag=True, plot_rdf=True, plot_msd=True):
         """Run the full parallel temperature sweep and collect results.
 
         All generated plots and animations will be written under `output_dir`.
         """
-        # Ensure output directory exists and remember it on the instance
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         pos0, L = self._generate_fcc_lattice(self.n_cells, self.rho_star)
@@ -589,7 +608,7 @@ class MDSimulation:
         out_path = os.path.join(getattr(self, "output_dir", "output"), output_file)
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         plt.savefig(out_path, dpi=150)
-        plt.show()
+        plt.close()  # Free memory; no GUI display on server
         print(f"\nComplete. Plot saved as '{out_path}'")
 
     def plot_msd(self, output_file="msd_plot.pdf"):
@@ -614,16 +633,13 @@ class MDSimulation:
         out_path = os.path.join(getattr(self, "output_dir", "output"), output_file)
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         plt.savefig(out_path, dpi=150)
-        plt.show()
+        plt.close()  # Free memory; no GUI display on server
         print(f"\nComplete. MSD plot saved as '{out_path}'")
 
         
     # DIAGNOSTICS
     def run_diagnostics(self, output_dir=None):
-        """Save energy and momentum conservation plots for every temperature.
-
-        If `output_dir` is None the instance `self.output_dir` is used (or 'diagnostics').
-        """
+        """Save energy and momentum conservation plots for every temperature."""
         if not self.simulation_results:
             print("[Diagnostics] No data available. Run the simulation first.")
             return
@@ -675,7 +691,7 @@ class MDSimulation:
             fig.tight_layout()
             combined_file = os.path.join(out_dir, f"diagnostics_{tag}.pdf")
             fig.savefig(combined_file, dpi=150)
-            plt.close(fig)
+            plt.close(fig) 
 
             prod_E   = result.tot_E[result.equil_steps:]
             E_mean   = float(np.mean(prod_E))
@@ -694,123 +710,97 @@ class MDSimulation:
         print(f"\n{'='*60}")
         print("Done running diagnostics.\n")
 
-    # ANI   MATION
+    # ANIMATION
     def animate(self, output_file="md_engine", format="both", output_dir=None):
-        """Run a sequential heating sweep and save an animated visualisation.
+        """Run a sequential heating sweep and save an animated visualisation."""
+        if not self.simulation_results:
+            print("[Animation] No simulation results found. Run the simulation first.")
+            return
 
-        Saved files (GIF/MP4) will be written into `output_dir` or the instance
-        `self.output_dir` if available.
-        """
         out_dir = output_dir or getattr(self, "output_dir", "output")
         os.makedirs(out_dir, exist_ok=True)
         gif_file = os.path.join(out_dir, output_file + ".gif")
         mp4_file = os.path.join(out_dir, output_file + ".mp4")
  
-        pos0, L  = self._generate_fcc_lattice(self.n_cells, self.rho_star)
-        N        = len(pos0)
-        r_max    = L / 2.0
-        dr_bin   = r_max / self.rdf_bins
-        skip     = self.animate_frame_skip
-        total_eq = self.animate_equil_steps
-        total_pr = self.animate_prod_steps
- 
-        # Each entry: (T_star, T_K, r_centers, g_avg, msd_arr, time_arr)
-        frames        = []
+        _, L   = self._generate_fcc_lattice(self.n_cells, self.rho_star)
+        r_max  = L / 2.0
         finished_rdfs = []
         all_speeds    = []
-        t_star_list   = self.animate_t_star_values
- 
+        sampling_plan = []
+        total_frames  = 0
+        t_star_list   = sorted(self.simulation_results)
+
         print(f"\nAnimation  —  {len(t_star_list)} temperatures, "
-              f"{total_eq} equil + {total_pr} prod steps, frame skip={skip}")
- 
-        rng      = np.random.default_rng(42)
-        pos      = pos0.copy()
-        pos_ref  = pos.copy()
-        vel      = rng.standard_normal((N, 3))
-        vel     -= vel.mean(axis=0)
-        vel      = self._rescale_velocities(vel, t_star_list[0])
-        nb_list  = self._update_neighbor_list(pos, L, self.r_skin_sq)
-        _, force = self._calculate_forces(pos, nb_list, L, self.r_cutoff_sq)
- 
+              f"trajectory interval={self.trajectory_interval}, render interval={self.render_interval}")
+
         for T_star in t_star_list:
-            T_K = T_star * self.eps_kb
-            vel = self._rescale_velocities(vel, T_star)
-            print(f"  T* = {T_star:.3f}  (T = {T_K:.1f} K)  equilibrating...", end="", flush=True)
- 
-            # ── Equilibration ────────────────────────────────────────────────
-            for step in range(total_eq):
-                pos, vel, _, force = self._verlet_step(
-                    pos, vel, force, self.dt, L, nb_list, self.r_cutoff_sq)
-                if self._needs_rebuild(pos, pos_ref, L, self.thresh_sq):
-                    nb_list = self._update_neighbor_list(pos, L, self.r_skin_sq)
-                    pos_ref = pos.copy()
-                if step % self.rescale_interval == 0:
-                    vel = self._rescale_velocities(vel, T_star)
- 
-            print(" recording...", end="", flush=True)
- 
-            # ── Production ───────────────────────────────────────────────────
-            g_acc              = np.zeros(self.rdf_bins)
-            count              = 0
-            initial_pos_unwrap = pos.copy()
-            pos_unwrap         = pos.copy()
-            msd_list           = []
-            time_list          = []
- 
-            for step in range(total_pr):
-                old_pos = pos.copy()
-                pos, vel, _, force = self._verlet_step(
-                    pos, vel, force, self.dt, L, nb_list, self.r_cutoff_sq)
-                # Unwrap via minimum-image displacement (mirrors _run_one_temperature)
-                pos_unwrap += self._apply_minimum_image(pos, old_pos, L)
- 
-                if self._needs_rebuild(pos, pos_ref, L, self.thresh_sq):
-                    nb_list = self._update_neighbor_list(pos, L, self.r_skin_sq)
-                    pos_ref = pos.copy()
- 
-                if step % skip == 0:
-                    speed             = np.sqrt(np.sum(vel ** 2, axis=1))
-                    r_centers, g_curr = self._calculate_rdf(
-                        pos, L, dr_bin, self.rdf_bins, r_max)
-                    g_acc  += g_curr
-                    count  += 1
-                    g_running = g_acc / count
- 
-                    msd_list.append(self._calculate_msd(pos_unwrap, initial_pos_unwrap))
-                    time_list.append(step * self.dt)
- 
-                    msd_arr  = np.array(msd_list)
-                    time_arr = np.array(time_list)
-                    _, _, D  = self._calculate_diffusion_coefficient(msd_arr, time_arr)
- 
-                    all_speeds.append(speed)
-                    frames.append((
-                        pos[:, :2].copy(), speed,
-                        r_centers, g_running,
-                        T_star, T_K, float(np.max(g_running)),
-                        msd_arr, time_arr, D,
-                    ))
- 
-            final_msd  = np.array(msd_list)
-            final_time = np.array(time_list)
-            _, _, D_final = self._calculate_diffusion_coefficient(final_msd, final_time)
-            finished_rdfs.append((T_star, T_K, r_centers,
-                                  g_acc / count, final_msd, final_time, D_final))
-            print(f" {count} frames.")
- 
+            result = self.simulation_results[T_star]
+            T_K = result.T_kelvin
+
+            positions = result.positions
+            velocities = result.velocities
+            g_running_avg = result.g_running_avg
+            msd_arr = result.msd if result.msd is not None else np.array([])
+            time_arr = result.time_step if result.time_step is not None else np.array([])
+
+            if len(positions) == 0 or len(velocities) == 0 or len(g_running_avg) == 0:
+                print(f"  [T* = {T_star:.3f}] No recorded data to animate.")
+                continue
+
+            traj_candidates = list(range(len(positions) - 1, -1, -self.trajectory_interval))
+            traj_candidates = list(reversed(traj_candidates))
+            render_candidates = list(range(0, len(g_running_avg), self.render_interval))
+
+            max_frames = min(self.frames_per_T_star, len(traj_candidates), len(render_candidates))
+            if self.frames_per_T_star > max_frames:
+                print(f"  [T* = {T_star:.3f}] Warning: requested {self.frames_per_T_star} frames, "
+                      f"but only {max_frames} are available.")
+
+            traj_indices = traj_candidates[-max_frames:] if max_frames else []
+            render_indices = render_candidates[:max_frames] if max_frames else []
+
+            print(f"  [T* = {T_star:.3f}] Using {max_frames} aligned frames.")
+
+            for traj_idx in traj_indices:
+                vel = velocities[traj_idx]
+                speed = np.sqrt(np.sum(vel ** 2, axis=1))
+                all_speeds.append(speed)
+
+            sampling_plan.append({
+                "T_star": T_star,
+                "T_K": T_K,
+                "traj_indices": traj_indices,
+                "render_indices": render_indices,
+                "result": result,
+            })
+            total_frames += max_frames
+
+            if msd_arr.size and time_arr.size:
+                _, _, D_final = self._calculate_diffusion_coefficient(msd_arr, time_arr)
+            else:
+                D_final = 0.0
+            finished_rdfs.append((
+                T_star, T_K, result.r_centers, result.g_avg,
+                msd_arr, time_arr, D_final
+            ))
+
+        if total_frames == 0:
+            print("[Animation] No frames available after sampling intervals.")
+            return
+
         s_concat     = np.concatenate(all_speeds)
         s_min, s_max = float(np.percentile(s_concat, 2)), float(np.percentile(s_concat, 98))
-        total_frames = len(frames)
         n_t          = len(t_star_list)
         print(f"\nTotal frames: {total_frames}.  Building figure...")
  
-        fig = plt.figure(figsize=(11, 5.5), facecolor="#0d0d0d")
-        fig.set_size_inches(11, 5.6)
-        gs      = fig.add_gridspec(1, 2, wspace=0.3, left=0.05, right=0.97, top=0.80, bottom=0.13)
+        fig = plt.figure(figsize=(15, 5.5), facecolor="#0d0d0d")
+        fig.set_size_inches(15, 5.6)
+        gs      = fig.add_gridspec(1, 3, wspace=0.28, left=0.05, right=0.98, top=0.80, bottom=0.13)
         ax_slab = fig.add_subplot(gs[0])
         ax_rdf  = fig.add_subplot(gs[1])
- 
-        for ax in (ax_slab, ax_rdf):
+        ax_msd  = fig.add_subplot(gs[2])
+
+        for ax in (ax_slab, ax_rdf, ax_msd):
             ax.set_facecolor("#111111")
             ax.tick_params(colors="0.7")
             for sp in ax.spines.values():
@@ -822,7 +812,11 @@ class MDSimulation:
         ax_slab.set_ylabel("y (σ)", color="0.7")
         slab_title = ax_slab.set_title("", color="white", fontsize=11)
  
-        init_xy, init_spd = frames[0][0], frames[0][1]
+        first_plan = sampling_plan[0]
+        first_result = first_plan["result"]
+        first_traj = first_plan["traj_indices"][0]
+        init_xy = first_result.positions[first_traj][:, :2]
+        init_spd = np.sqrt(np.sum(first_result.velocities[first_traj] ** 2, axis=1))
         sc   = ax_slab.scatter(init_xy[:, 0], init_xy[:, 1],
                                c=init_spd, cmap="plasma", vmin=s_min, vmax=s_max,
                                s=18, alpha=0.9, linewidths=0)
@@ -837,59 +831,193 @@ class MDSimulation:
         ax_rdf.set_ylabel("g(r)", color="0.7")
         ax_rdf.axhline(1.0, color="0.4", ls="--", lw=0.8)
         rdf_title = ax_rdf.set_title("", color="white", fontsize=11)
+
+        ax_msd.set_xlim(0, self.prod_steps * self.dt)
+        ax_msd.set_xlabel("time (t*)", color="0.7")
+        ax_msd.set_ylabel(r"MSD ($\sigma^2$)", color="0.7")
+        ax_msd.set_title("", color="white", fontsize=11)
+        ax_msd.grid(True, alpha=0.15)
  
         ghost_cmap      = plt.cm.cool
         live_line_rdf,  = ax_rdf.plot([], [], color="#ff6b35", lw=1.8, zorder=5)
+        live_line_msd,  = ax_msd.plot([], [], color="#2ecc71", lw=1.8, zorder=5)
         ghost_handles   = []
-        drawn_ghosts    = set()
+        ghost_msd_handles = []
         main_title      = fig.suptitle("", color="white", fontsize=14, y=0.96)
         info_text       = fig.text(0.5, 0.90, "", color="#a8dadc", fontsize=11, ha="center")
         phase_colors    = {"SOLID": "#3498db", "LIQUID": "#e74c3c", "GAS": "#2ecc71"}
+
+        # Pre-compute ghost colors and phase labels for the text key
+        ghost_colors       = []
+        ghost_phase_labels = []
+        for idx, (T_g, T_K_g, r_g, g_g, msd_g, time_g, D_g) in enumerate(finished_rdfs):
+            col = ghost_cmap(idx / max(n_t - 1, 1))
+            ghost_colors.append(col)
+            phase_g = self._classify_phase(g_g, D_g, msd_g)
+            ghost_phase_labels.append(f"T*={T_g:.2f} ({phase_g})")
+            gl, = ax_rdf.plot(r_g * self.sigma, g_g,
+                              color=col, lw=1.0, alpha=0.0, zorder=2)
+            ghost_handles.append(gl)
+            mg, = ax_msd.plot(time_g, msd_g,
+                              color=col, lw=1.0, alpha=0.0, zorder=2)
+            ghost_msd_handles.append(mg)
+
+        # ── Text-based color key ──────────────────────────────────────────────
+        # Past temperatures: RDF → top-right corner, MSD → top-right corner
+        # Live temperature : RDF → top-left corner,  MSD → top-left corner
+        # Plain ax.text() artists sidestep the Legend white-block blit bug entirely.
+        _dy   = 0.09   # vertical step between key rows
+        _ytop = 0.97   # y of the first row (axes-fraction coords)
+
+        rdf_key_markers, rdf_key_labels = [], []
+        msd_key_markers, msd_key_labels = [], []
+        for idx, (col, lbl) in enumerate(zip(ghost_colors, ghost_phase_labels)):
+            y = _ytop - idx * _dy
+            # RDF panel: past-T key on the right
+            tm = ax_rdf.text(0.72, y, "━", color=col, fontsize=9,
+                             transform=ax_rdf.transAxes, va="top", alpha=0.0)
+            tl = ax_rdf.text(0.76, y, lbl, color="0.75", fontsize=7,
+                             transform=ax_rdf.transAxes, va="top", alpha=0.0)
+            rdf_key_markers.append(tm)
+            rdf_key_labels.append(tl)
+            # MSD panel: past-T key on the right
+            mm = ax_msd.text(0.72, y, "━", color=col, fontsize=9,
+                             transform=ax_msd.transAxes, va="top", alpha=0.0)
+            ml = ax_msd.text(0.76, y, lbl, color="0.75", fontsize=7,
+                             transform=ax_msd.transAxes, va="top", alpha=0.0)
+            msd_key_markers.append(mm)
+            msd_key_labels.append(ml)
+
+      
+        _live_y_msd = _ytop
+        rdf_live_marker = ax_rdf.text(0.02, _ytop, "━", color="#ff6b35", fontsize=9,
+                                      transform=ax_rdf.transAxes, va="top")
+        rdf_live_text   = ax_rdf.text(0.06, _ytop, "", color="#ff6b35", fontsize=7,
+                                      transform=ax_rdf.transAxes, va="top")
+        msd_live_marker = ax_msd.text(0.02, _live_y_msd, "━", color="#2ecc71", fontsize=9,
+                                      transform=ax_msd.transAxes, va="top")
+        msd_live_text   = ax_msd.text(0.06, _live_y_msd, "", color="#2ecc71", fontsize=7,
+                                      transform=ax_msd.transAxes, va="top")
+
+        last_temp = {"value": None}
+
+        def _update_legends(T_star_f):
+            for idx, (T_g, _, _, _, _, _, _) in enumerate(finished_rdfs):
+                active = T_star_f is not None and T_g < T_star_f
+                a = 0.85 if active else 0.0
+                ghost_handles[idx].set_alpha(a)
+                ghost_msd_handles[idx].set_alpha(a)
+                rdf_key_markers[idx].set_alpha(a)
+                rdf_key_labels[idx].set_alpha(a)
+                msd_key_markers[idx].set_alpha(a)
+                msd_key_labels[idx].set_alpha(a)
+            if T_star_f is not None:
+                rdf_live_text.set_text(f"T*={T_star_f:.2f} (live)")
+                msd_live_text.set_text(f"T*={T_star_f:.2f} (live)")
+            else:
+                rdf_live_text.set_text("")
+                msd_live_text.set_text("")
+
+        def _frame_generator():
+            for plan in sampling_plan:
+                result = plan["result"]
+                T_star = plan["T_star"]
+                T_K = plan["T_K"]
+                for traj_idx, render_idx in zip(plan["traj_indices"], plan["render_indices"]):
+                    pos = result.positions[traj_idx]
+                    vel = result.velocities[traj_idx]
+                    speed = np.sqrt(np.sum(vel ** 2, axis=1))
+                    g_live = result.g_running_avg[render_idx]
+
+                    msd_arr = result.msd if result.msd is not None else np.array([])
+                    time_arr = result.time_step if result.time_step is not None else np.array([])
+                    msd_live = msd_arr[:render_idx + 1]
+                    time_live = time_arr[:render_idx + 1]
+                    _, _, D = self._calculate_diffusion_coefficient(msd_live, time_live)
+
+                    yield (
+                        pos[:, :2].copy(), speed,
+                        result.r_centers, g_live,
+                        T_star, T_K, float(np.max(g_live)),
+                        msd_live, time_live, D,
+                    )
  
-        def update(fi):
-            # Unpack the enriched frame tuple
-            atom_xy, speed, r_centers, g_running, T_star_f, T_K_f, peak_g, msd_arr, time_arr, D = frames[fi]
- 
-            # Use _calculate_diffusion_coefficient + _classify_phase exactly as in run()
+        # Pre-compute per-temperature MSD y-limits so solid vibrations are visible
+        # rather than crushed flat by the larger liquid MSD range.
+        msd_ylims = {}
+        for plan in sampling_plan:
+            result_p = plan["result"]
+            T_star_p = plan["T_star"]
+            if result_p.msd is not None and len(result_p.msd) > 0:
+                msd_hi  = float(np.max(result_p.msd))
+                msd_lo  = float(np.min(result_p.msd))
+                pad     = max((msd_hi - msd_lo) * 0.15, msd_hi * 0.05, 1e-4)
+                msd_ylims[T_star_p] = (max(0.0, msd_lo - pad), msd_hi + pad)
+            else:
+                msd_ylims[T_star_p] = (0.0, 1.0)
+
+        def update(frame):
+            (atom_xy, speed, r_centers, g_running,
+             T_star_f, T_K_f, peak_g, msd_arr, time_arr, D) = frame
             phase = self._classify_phase(g_running, D, msd_arr)
- 
+
             sc.set_offsets(atom_xy)
             sc.set_array(speed)
             slab_title.set_text(f"Atoms (xy)  |  T* = {T_star_f:.3f}  ({T_K_f:.1f} K)")
- 
-            # Draw ghost traces for fully completed temperatures
-            for idx, (T_g, T_K_g, r_g, g_g, msd_g, time_g, D_g) in enumerate(finished_rdfs):
-                if T_g < T_star_f and idx not in drawn_ghosts:
-                    col     = ghost_cmap(idx / max(n_t - 1, 1))
-                    phase_g = self._classify_phase(g_g, D_g, msd_g)
-                    gl, = ax_rdf.plot(r_g * self.sigma, g_g,
-                                      color=col, lw=1.0, alpha=0.4,
-                                      label=f"T*={T_g:.2f} ({phase_g})", zorder=2)
-                    ghost_handles.append(gl)
-                    drawn_ghosts.add(idx)
- 
+
+            if last_temp["value"] != T_star_f:
+                _update_legends(T_star_f)
+                last_temp["value"] = T_star_f
+                ylo, yhi = msd_ylims.get(T_star_f, (0.0, 1.0))
+                ax_msd.set_ylim(ylo, yhi)
+
             live_line_rdf.set_data(r_centers * self.sigma, g_running)
-            live_line_rdf.set_label(f"T*={T_star_f:.2f} (live)")
             rdf_title.set_text("g(r) running avg")
-            ax_rdf.legend(handles=ghost_handles + [live_line_rdf],
-                          loc="upper right", fontsize=7,
-                          framealpha=0.2, labelcolor="white")
+            live_line_msd.set_data(time_arr, msd_arr)
+            ax_msd.set_title("MSD running avg", color="white", fontsize=11)
             info_text.set_text(f"g(r) peak = {peak_g:.2f}   D = {D:.4e} σ²/τ")
             main_title.set_text(f"Melting & Diffusion  |  PHASE: {phase}")
             main_title.set_color(phase_colors.get(phase, "white"))
-            return (sc, live_line_rdf, slab_title, rdf_title, main_title, info_text)
- 
-        ani = FuncAnimation(fig, update, frames=total_frames, interval=60, blit=False)
- 
-        if format in ("gif", "both"):
+            return (sc, live_line_rdf, live_line_msd, slab_title, rdf_title,
+                    main_title, info_text,
+                    rdf_live_marker, rdf_live_text, msd_live_marker, msd_live_text,
+                    *ghost_handles, *ghost_msd_handles,
+                    *rdf_key_markers, *rdf_key_labels,
+                    *msd_key_markers, *msd_key_labels)
+
+        def init():
+            live_line_rdf.set_data([], [])
+            live_line_msd.set_data([], [])
+            _update_legends(None)
+            return (sc, live_line_rdf, live_line_msd, slab_title, rdf_title,
+                    main_title, info_text,
+                    rdf_live_marker, rdf_live_text, msd_live_marker, msd_live_text,
+                    *ghost_handles, *ghost_msd_handles,
+                    *rdf_key_markers, *rdf_key_labels,
+                    *msd_key_markers, *msd_key_labels)
+
+        def _build_animation():
+            return FuncAnimation(
+                fig, update, frames=_frame_generator(),
+                interval=60, blit=True, init_func=init,
+                cache_frame_data=False,
+            )
+
+        def _save_gif(ani):
             print(f"\nSaving GIF  → '{gif_file}' ({total_frames} frames) ...")
             try:
-                ani.save(gif_file, writer="pillow", fps=20, dpi=130)
+                from matplotlib.animation import PillowWriter
+                gif_writer = PillowWriter(fps=20)
+                ani.save(
+                    gif_file,
+                    writer=gif_writer,
+                    dpi=90,
+                )
                 print(f"  ✓ GIF saved: '{gif_file}'")
             except Exception as e:
                 print(f"  ✗ GIF failed: {e}")
 
-        if format in ("mp4", "both"):
+        def _save_mp4(ani):
             print(f"Saving MP4  → '{mp4_file}' ({total_frames} frames) ...")
             try:
                 from matplotlib.animation import FFMpegWriter
@@ -900,6 +1028,9 @@ class MDSimulation:
                         "-vf",      "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                         "-crf",     "18",
                         "-preset",  "fast",
+                        "-tune",    "animation",
+                        "-threads", str(os.cpu_count() or 4),
+                        "-movflags", "+faststart",
                     ]
                 )
                 ani.save(mp4_file, writer=mp4_writer, dpi=130)
@@ -908,11 +1039,17 @@ class MDSimulation:
                 print("  ✗ MP4 failed: FFmpeg not found — install FFmpeg or use format='gif'")
             except Exception as e:
                 print(f"  ✗ MP4 failed: {e}")
- 
-        try:
-            plt.show()
-        except Exception:
-            pass
+
+        if format == "both":
+            _save_gif(_build_animation())
+            _save_mp4(_build_animation())
+        elif format == "gif":
+            _save_gif(_build_animation())
+        elif format == "mp4":
+            _save_mp4(_build_animation())
+
+        plt.close(fig)  # Free memory; no GUI display on server
+
 
 # MAIN WORKFLOW
 def main():
@@ -936,7 +1073,6 @@ def main():
         plot_msd = input("Plot MSD after simulation? [y/n] (default: y): ").strip().lower()
         plot_msd = plot_msd in ("", "y", "yes")
 
-        # Ask user where to write all outputs (plots, animations, diagnostics)
         raw_out = input("  Output folder for all outputs [output]: ").strip()
         out_dir = raw_out if raw_out else "output"
         os.makedirs(out_dir, exist_ok=True)
