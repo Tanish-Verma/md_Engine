@@ -235,6 +235,10 @@ class MDSimulation:
         self.simulation_results: dict = {}
 
     @classmethod
+    def defaults(cls):
+        return SimulationConfig()
+    
+    @classmethod
     def from_params(cls, **kwargs):
         """Create MDSimulation from keyword arguments by building a SimulationConfig internally."""
         return cls(SimulationConfig(**kwargs))
