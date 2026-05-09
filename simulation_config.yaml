@@ -1,0 +1,24 @@
+cell_param_a: null
+dt: 0.005
+eps: 0.014
+equil_steps: 2000
+frames_per_T_star: 200
+n_cells: 4
+n_workers: null
+prod_steps: 4000
+r_cutoff: 2.5
+r_skin: 3.0
+rdf_bins: 200
+rdf_interval: 10
+render_interval: 2
+rescale_interval: 10
+rho_star: 0.8442
+sigma: 3.65
+t_star_values:
+- 0.01
+- 0.2
+- 0.4
+- 0.6
+- 0.8
+- 1.0
+trajectory_interval: 2

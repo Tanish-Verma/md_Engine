@@ -1,14 +1,14 @@
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend — must come before any other matplotlib imports
-
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from multiprocessing import Pool
 from scipy.constants import k as k_B
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Optional
 import os
+import yaml
+import h5py
+import hdf5plugin
 
 
 # ── DATA STRUCTURES ───────────────────────────────────────────────────────────
@@ -46,6 +46,8 @@ class SimulationConfig:
     render_interval:   int        = 2
     frames_per_T_star: int        = 200
 
+    def to_dict(self):
+        return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
 # CLI 
@@ -231,6 +233,7 @@ class MDSimulation:
         self.render_interval     = config.render_interval
         self.frames_per_T_star   = config.frames_per_T_star
 
+        MDSimulation.save_yaml(config, filename="simulation_config.yaml")
         # Results storage
         self.simulation_results: dict = {}
 
@@ -243,8 +246,78 @@ class MDSimulation:
         """Create MDSimulation from keyword arguments by building a SimulationConfig internally."""
         return cls(SimulationConfig(**kwargs))
 
-    # PHYSICS
+    @classmethod
+    def save_yaml(cls, config: SimulationConfig, filename="simulation_config.yaml"):
+        """Save the simulation configuration to a YAML file."""
+        with open(filename, "w") as f:
+            yaml.dump(config.to_dict(), f)
 
+    @classmethod
+    def load_yaml(cls, filename="simulation_config.yaml"):
+        """Load simulation configuration from a YAML file and return an MDSimulation instance."""
+        with open(filename, "r") as f:
+            data = yaml.safe_load(f)
+        return cls(SimulationConfig(**data))
+
+
+    def save_results(self, filename="results.h5"):
+        with h5py.File(filename, "w") as f:
+            for T_star, result in self.simulation_results.items():
+                grp = f.create_group(f"T_{T_star:.4f}")
+                
+                # Large trajectory arrays — chunk + compress
+                grp.create_dataset("positions",   data=result.positions,
+                                chunks=True, **hdf5plugin.LZ4())
+                grp.create_dataset("velocities",  data=result.velocities,
+                                chunks=True, **hdf5plugin.LZ4())
+                grp.create_dataset("g_running_avg", data=result.g_running_avg,
+                                chunks=True, **hdf5plugin.LZ4())
+
+                # Smaller 1D arrays — store as-is
+                grp.create_dataset("kin_E",      data=result.kin_E)
+                grp.create_dataset("pot_E",      data=result.pot_E)
+                grp.create_dataset("tot_E",      data=result.tot_E)
+                grp.create_dataset("momentum",   data=result.momentum)
+                grp.create_dataset("r_centers",  data=result.r_centers)
+                grp.create_dataset("g_avg",      data=result.g_avg)
+
+                if result.msd is not None:
+                    grp.create_dataset("msd",       data=result.msd)
+                    grp.create_dataset("time_step", data=result.time_step)
+
+                # Scalars as attributes
+                grp.attrs["T_star"]      = result.T_star
+                grp.attrs["T_kelvin"]    = result.T_kelvin
+                grp.attrs["equil_steps"] = result.equil_steps
+                grp.attrs["prod_steps"]  = result.prod_steps
+
+    @classmethod
+    def load_results(cls, filename="results.h5"):
+        """Returns a dict of T_star → SimulationResult, arrays are lazy (not in RAM)."""
+        results = {}
+        with h5py.File(filename, "r") as f:
+            for key in f:
+                grp = f[key]
+                T_star = float(grp.attrs["T_star"])
+                results[T_star] = MDSimulation.SimulationResult(
+                    T_star      = T_star,
+                    T_kelvin    = float(grp.attrs["T_kelvin"]),
+                    equil_steps = int(grp.attrs["equil_steps"]),
+                    prod_steps  = int(grp.attrs["prod_steps"]),
+                    r_centers   = grp["r_centers"][:],        # small, load fully
+                    g_avg       = grp["g_avg"][:],
+                    kin_E       = grp["kin_E"][:],
+                    pot_E       = grp["pot_E"][:],
+                    tot_E       = grp["tot_E"][:],
+                    momentum    = grp["momentum"][:],
+                    positions   = grp["positions"],            # lazy — HDF5 dataset
+                    velocities  = grp["velocities"],           # lazy — HDF5 dataset
+                    g_running_avg = grp["g_running_avg"],      # lazy
+                    msd         = grp["msd"][:] if "msd" in grp else None,
+                    time_step   = grp["time_step"][:] if "time_step" in grp else None,
+                )
+        return results
+    # PHYSICS
     @staticmethod
     def _calculate_lennard_jones_properties(r_sq, r_cutoff_sq):
         """Shifted-force LJ potential and force/r for vectorised pair arrays."""
@@ -538,13 +611,27 @@ class MDSimulation:
         )
 
     # ORCHESTRATION
-    def run(self, output_dir="output", run_diag=True, plot_rdf=True, plot_msd=True):
+    def run(
+        self,
+        output_dir="output",
+        run_diag=False,
+        plot_rdf=False,
+        plot_msd=False,
+        to_save=False,
+        rdf_plot_name="rdf_plot.pdf",
+        msd_plot_name="msd_plot.pdf",
+        results_name="results.h5",
+    ):
         """Run the full parallel temperature sweep and collect results.
 
         All generated plots and animations will be written under `output_dir`.
         """
+        if not output_dir:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            output_dir = base_dir
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
+        
         pos0, L = self._generate_fcc_lattice(self.n_cells, self.rho_star)
         N       = len(pos0)
         print(f"\nSystem: N = {N} atoms, L = {L:.4f} σ")
@@ -580,11 +667,14 @@ class MDSimulation:
             self.simulation_results[result.T_star] = result
 
         if plot_rdf:
-            self.plot_radial_distribution_function("rdf_plot.pdf", results)
+            self.plot_radial_distribution_function(rdf_plot_name, results)
         if plot_msd:
-            self.plot_msd("msd_plot.pdf")
+            self.plot_msd(msd_plot_name)
         if run_diag:
             self.run_diagnostics()
+        if to_save:
+            results_file = os.path.join(self.output_dir, results_name)
+            self.save_results(results_file)
 
         return results
 
@@ -1076,6 +1166,20 @@ def main():
         plot_rdf = plot_rdf in ("", "y", "yes")
         plot_msd = input("Plot MSD after simulation? [y/n] (default: y): ").strip().lower()
         plot_msd = plot_msd in ("", "y", "yes")
+        to_save = input("Save results to HDF5? [y/n] (default: n): ").strip().lower()
+        to_save = to_save in ("y", "yes")
+
+        rdf_plot_name = None
+        if plot_rdf:
+            rdf_plot_name = input("  RDF plot filename [rdf_plot.pdf]: ").strip() or "rdf_plot.pdf"
+
+        msd_plot_name = None
+        if plot_msd:
+            msd_plot_name = input("  MSD plot filename [msd_plot.pdf]: ").strip() or "msd_plot.pdf"
+
+        results_name = None
+        if to_save:
+            results_name = input("  Results filename [results.h5]: ").strip() or "results.h5"
 
         raw_out = input("  Output folder for all outputs [output]: ").strip()
         out_dir = raw_out if raw_out else "output"
@@ -1084,7 +1188,16 @@ def main():
         print("\n" + "=" * 70)
         print("  RUNNING SIMULATION...")
         print("=" * 70)
-        sim.run(output_dir=out_dir, run_diag=run_diag, plot_rdf=plot_rdf, plot_msd=plot_msd)
+        sim.run(
+            output_dir=out_dir,
+            run_diag=run_diag,
+            plot_rdf=plot_rdf,
+            plot_msd=plot_msd,
+            to_save=to_save,
+            rdf_plot_name=rdf_plot_name or "rdf_plot.pdf",
+            msd_plot_name=msd_plot_name or "msd_plot.pdf",
+            results_name=results_name or "results.h5",
+        )
 
         print("\n" + "=" * 70)
         print("  SIMULATION COMPLETE")
