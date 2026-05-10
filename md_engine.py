@@ -47,6 +47,10 @@ class SimulationConfig:
     render_interval:   int        = 2
     frames_per_T_star: int        = 200
 
+    # Storage control
+    save_positions:  bool = True
+    save_velocities: bool = True
+
     def to_dict(self):
         def normalize(value):
             if isinstance(value, np.ndarray):
@@ -245,6 +249,10 @@ class MDSimulation:
         self.render_interval     = config.render_interval
         self.frames_per_T_star   = config.frames_per_T_star
 
+        # Storage control
+        self.save_positions  = config.save_positions
+        self.save_velocities = config.save_velocities
+
         MDSimulation.save_yaml(config, filename="simulation_config.yaml")
         # Results storage
         self.simulation_results: dict = {}
@@ -295,10 +303,12 @@ class MDSimulation:
                 grp = f.create_group(f"T_{T_star:.4f}")
                 
                 # Large trajectory arrays — chunk + compress
-                grp.create_dataset("positions",   data=result.positions,
-                                chunks=True, **hdf5plugin.LZ4())
-                grp.create_dataset("velocities",  data=result.velocities,
-                                chunks=True, **hdf5plugin.LZ4())
+                if result.positions is not None and getattr(result.positions, "size", 0) > 0:
+                    grp.create_dataset("positions",   data=result.positions,
+                                    chunks=True, **hdf5plugin.LZ4())
+                if result.velocities is not None and getattr(result.velocities, "size", 0) > 0:
+                    grp.create_dataset("velocities",  data=result.velocities,
+                                    chunks=True, **hdf5plugin.LZ4())
                 grp.create_dataset("g_running_avg", data=result.g_running_avg,
                                 chunks=True, **hdf5plugin.LZ4())
 
@@ -327,6 +337,8 @@ class MDSimulation:
         with h5py.File(filename, "r") as f:
             for key in f:
                 grp = f[key]
+                positions = grp["positions"] if "positions" in grp else None
+                velocities = grp["velocities"] if "velocities" in grp else None
                 T_star = float(grp.attrs["T_star"])
                 results[T_star] = MDSimulation.SimulationResult(
                     T_star      = T_star,
@@ -339,8 +351,8 @@ class MDSimulation:
                     pot_E       = grp["pot_E"][:],
                     tot_E       = grp["tot_E"][:],
                     momentum    = grp["momentum"][:],
-                    positions   = grp["positions"],            # lazy — HDF5 dataset
-                    velocities  = grp["velocities"],           # lazy — HDF5 dataset
+                    positions   = positions,                   # lazy — HDF5 dataset
+                    velocities  = velocities,                  # lazy — HDF5 dataset
                     g_running_avg = grp["g_running_avg"],      # lazy
                     msd         = grp["msd"][:] if "msd" in grp else None,
                     time_step   = grp["time_step"][:] if "time_step" in grp else None,
@@ -533,6 +545,8 @@ class MDSimulation:
         rescale_interval: int
         rdf_interval:     int
         rdf_bins:         int
+        save_positions:   bool = True
+        save_velocities:  bool = True
 
     @dataclass
     class SimulationResult:
@@ -546,8 +560,8 @@ class MDSimulation:
         momentum:    np.ndarray
         equil_steps: int
         prod_steps:  int
-        positions:   np.ndarray
-        velocities:  np.ndarray
+        positions:   Optional[np.ndarray]
+        velocities:  Optional[np.ndarray]
         msd:         Optional[np.ndarray] = None
         time_step:   Optional[np.ndarray] = None
         g_running_avg: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float32))
@@ -630,8 +644,10 @@ class MDSimulation:
         for step in range(args.prod_steps):
             global_step = args.equil_steps + step
             old_pos = pos.copy()
-            positions_recorded.append(pos.astype(np.float32))
-            velocities_recorded.append(vel.astype(np.float32))
+            if args.save_positions:
+                positions_recorded.append(pos.astype(np.float32))
+            if args.save_velocities:
+                velocities_recorded.append(vel.astype(np.float32))
             pos, vel, pe, force = MDSimulation._verlet_step(pos, vel, force, args.dt, args.L, neighbor_list, r_cutoff_sq)
             pos_unwrapped += MDSimulation._apply_minimum_image(pos, old_pos, args.L)
 
@@ -669,6 +685,9 @@ class MDSimulation:
         else:
             g_running_avg = np.zeros((0, args.rdf_bins), dtype=np.float32)
 
+        positions_array = np.array(positions_recorded, dtype=np.float32) if positions_recorded else None
+        velocities_array = np.array(velocities_recorded, dtype=np.float32) if velocities_recorded else None
+
         return MDSimulation.SimulationResult(
             T_star      = args.T_star,
             T_kelvin    = T_K,
@@ -682,8 +701,8 @@ class MDSimulation:
             prod_steps  = args.prod_steps,
             msd         = np.array(msd) if msd else None,
             time_step   = np.array(time_step) if time_step else None,
-            positions   = np.array(positions_recorded, dtype=np.float32),
-            velocities  = np.array(velocities_recorded, dtype=np.float32),
+            positions   = positions_array,
+            velocities  = velocities_array,
             g_running_avg = g_running_avg
         )
 
@@ -731,6 +750,8 @@ class MDSimulation:
                 rescale_interval = self.rescale_interval,
                 rdf_interval     = self.rdf_interval,
                 rdf_bins         = self.rdf_bins,
+                save_positions   = self.save_positions,
+                save_velocities  = self.save_velocities,
             )
             for T_star in self.t_star_values
         ]
@@ -913,6 +934,10 @@ class MDSimulation:
             g_running_avg = result.g_running_avg
             msd_arr = result.msd if result.msd is not None else np.array([])
             time_arr = result.time_step if result.time_step is not None else np.array([])
+
+            if positions is None or velocities is None:
+                print(f"  [T* = {T_star:.3f}] No positions/velocities recorded for animation.")
+                continue
 
             if len(positions) == 0 or len(velocities) == 0 or len(g_running_avg) == 0:
                 print(f"  [T* = {T_star:.3f}] No recorded data to animate.")
@@ -1220,7 +1245,6 @@ class MDSimulation:
             _save_mp4(_build_animation())
 
         plt.close(fig)  # Free memory; no GUI display on server
-
 
 # MAIN WORKFLOW
 def main():
