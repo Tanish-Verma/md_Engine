@@ -9,6 +9,7 @@ import os
 import yaml
 import h5py
 import hdf5plugin
+import time
 
 
 # ── DATA STRUCTURES ───────────────────────────────────────────────────────────
@@ -47,7 +48,18 @@ class SimulationConfig:
     frames_per_T_star: int        = 200
 
     def to_dict(self):
-        return {f.name: getattr(self, f.name) for f in fields(self)}
+        def normalize(value):
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, list):
+                return [normalize(item) for item in value]
+            if isinstance(value, tuple):
+                return [normalize(item) for item in value]
+            return value
+
+        return {f.name: normalize(getattr(self, f.name)) for f in fields(self)}
 
 
 # CLI 
@@ -246,11 +258,28 @@ class MDSimulation:
         """Create MDSimulation from keyword arguments by building a SimulationConfig internally."""
         return cls(SimulationConfig(**kwargs))
 
+    @staticmethod
+    def _print_progress(stage, T_star, step, total_steps, last_percent, elapsed_time):
+        percent = int((step + 1) / total_steps * 100)
+
+        # Print every 5%
+        if percent >= last_percent + 5 or percent == 100:
+            hours, remainder = divmod(int(elapsed_time), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            print(
+                f"  [T* = {T_star:.3f}] {stage}: "
+                f"{percent:3d}% ({step + 1}/{total_steps}) — elapsed: {time_str}",
+                flush=True
+            )
+            return percent
+
+        return last_percent
     @classmethod
     def save_yaml(cls, config: SimulationConfig, filename="simulation_config.yaml"):
         """Save the simulation configuration to a YAML file."""
         with open(filename, "w") as f:
-            yaml.dump(config.to_dict(), f)
+            yaml.safe_dump(config.to_dict(), f, sort_keys=False)
 
     @classmethod
     def load_yaml(cls, filename="simulation_config.yaml"):
@@ -445,25 +474,46 @@ class MDSimulation:
 
     @staticmethod
     def _classify_phase(g_avg, D=None, msd=None):
+
         g_max = np.max(g_avg)
+
         n_tail = max(1, len(g_avg) // 10)
-        tail_dev = abs(float(np.mean(g_avg[-n_tail:])) - 1.0)
+        tail_mean = float(np.mean(g_avg[-n_tail:]))
+        tail_dev  = abs(tail_mean - 1.0)
 
-        # Structural evidence
-        structural = "SOLID" if (g_max > 3.5 or tail_dev >= 0.05) else "LIQUID"
+        # Strong long-range ordering
+        if g_max > 3.5 or tail_dev >= 0.05:
+            structural = "SOLID"
 
-        # Transport evidence (if available)
+        elif g_max < 1.5 and tail_dev < 0.03:
+            structural = "GAS"
+
+        else:
+            structural = "LIQUID"
+
         if D is not None and msd is not None:
-            if D > 1e-2:     
-                transport = "LIQUID"
-            else:
-                transport = structural  # fallback
 
-            # Require agreement, or flag ambiguity
+            # Very high diffusion → gas
+            if D > 0.10:
+                transport = "GAS"
+
+            # Moderate diffusion → liquid
+            elif D > 1e-2:
+                transport = "LIQUID"
+
+            # Tiny diffusion → solid
+            else:
+                transport = "SOLID"
+
             if structural == transport:
                 return structural
-            else:
-                return f"{transport}?"   # near transition, flag it
+
+            # Gas-liquid ambiguity near critical/supercritical region
+            if {"GAS", "LIQUID"} == {structural, transport}:
+                return "SUPERCRITICAL?"
+
+            # Generic coexistence / transition marker
+            return f"{transport}?"
 
         return structural
 
@@ -505,6 +555,7 @@ class MDSimulation:
     # PARALLEL WORKER
     @staticmethod
     def _run_one_temperature(args: 'MDSimulation.WorkerArgs') -> 'MDSimulation.SimulationResult':
+        start_time = time.time()
 
         r_cutoff_sq = args.r_cutoff ** 2
         r_skin_sq   = args.r_skin ** 2
@@ -528,26 +579,43 @@ class MDSimulation:
         tot_E_trace = np.zeros(total_steps)
         mom_trace   = np.zeros((total_steps, 3))
 
+        equil_progress = -5
+        prod_progress  = -5
+
         T_K = args.T_star * args.eps_kb
         print(f"  [T* = {args.T_star:.3f} | T = {T_K:.2f} K]  "
               f"equilibrating ({args.equil_steps} steps)...", flush=True)
 
         for step in range(args.equil_steps):
-            pos, vel, pe, force = MDSimulation._verlet_step(pos, vel, force, args.dt, args.L, neighbor_list, r_cutoff_sq)
-            
+            pos, vel, pe, force = MDSimulation._verlet_step(
+                pos, vel, force,
+                args.dt, args.L,
+                neighbor_list,
+                r_cutoff_sq
+            )
             if MDSimulation._needs_rebuild(pos, pos_ref, args.L, thresh_sq):
                 neighbor_list = MDSimulation._update_neighbor_list(pos, args.L, r_skin_sq)
                 pos_ref = pos.copy()
+
             if step % args.rescale_interval == 0:
                 vel = MDSimulation._rescale_velocities(vel, args.T_star)
+
             ke                = 0.5 * np.sum(vel ** 2)
             kin_E_trace[step] = ke
             pot_E_trace[step] = pe
             tot_E_trace[step] = ke + pe
             mom_trace[step]   = vel.sum(axis=0)
 
-        print(f"  [T* = {args.T_star:.3f}]  production ({args.prod_steps} steps)...", flush=True)
+            equil_progress = MDSimulation._print_progress(
+                "Equilibration",
+                args.T_star,
+                step,
+                args.equil_steps,
+                equil_progress,
+                time.time() - start_time
+            )
 
+        print(f"  [T* = {args.T_star:.3f}]  production ({args.prod_steps} steps)...", flush=True)
         g_average_accumulation = np.zeros(args.rdf_bins)
         count     = 0
         r_centers = None
@@ -584,6 +652,15 @@ class MDSimulation:
                 g_average_accumulation += g_curr
                 g_running.append(g_curr.astype(np.float32))
                 count += 1
+
+            prod_progress = MDSimulation._print_progress(
+                "Production",
+                args.T_star,
+                step,
+                args.prod_steps,
+                prod_progress,
+                time.time() - start_time
+            )
 
         g_running_arr = np.array(g_running, dtype=np.float32)
         if len(g_running_arr):
