@@ -525,7 +525,7 @@ class MDSimulation:
                 return "SUPERCRITICAL?"
 
             # Generic coexistence / transition marker
-            return f"{transport}?"
+            return f"{transport}+{structural}"
 
         return structural
 

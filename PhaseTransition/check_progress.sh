@@ -2,10 +2,11 @@
 # ~/md_Engine/PhaseTransition/check_progress.sh
 # Quick summary of done / running / failed jobs
 
-OUTDIR="/home/co24btech11023/md_Engine/PhaseTransition/data"
+N_CELLS=4
+OUTDIR="/home/co24btech11023/md_Engine/PhaseTransition/data_${N_CELLS}"
 LOGDIR="/home/co24btech11023/md_Engine/PhaseTransition/logs"
 
-TOTAL=210
+TOTAL=1681  # 41 rho values x 41 T* values = 1681 total points
 DONE=$(ls "$OUTDIR"/*.h5 2>/dev/null | wc -l)
 RUNNING=$(squeue -u co24btech11023 --noheader 2>/dev/null | wc -l)
 FAILED=$(grep -l "Error\|Traceback\|FAILED" "$LOGDIR"/*.log 2>/dev/null | wc -l)

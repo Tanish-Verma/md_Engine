@@ -7,20 +7,25 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="/home/co24btech11023/md_Engine/.venv/bin/python3"
 RUN_SCRIPT="$SCRIPT_DIR/run_one_point.py"
-OUTDIR="/home/co24btech11023/md_Engine/PhaseTransition/data"
+N_CELLS=4
+OUTDIR="/home/co24btech11023/md_Engine/PhaseTransition/data_${N_CELLS}"
 LOGDIR="/home/co24btech11023/md_Engine/PhaseTransition/logs"
 
 mkdir -p "$OUTDIR"
 mkdir -p "$LOGDIR"
 
 # Grid parameters
-RHO_VALUES=(0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0)
+RHO_VALUES=($("$PYTHON" -c "
+import numpy as np
+vals = np.linspace(0.1, 2.0, 41)
+print(' '.join(f'{v:.4f}' for v in vals))
+"))
 
 # 21 T* values from 0.5 to 2.0 inclusive
 # Generate with python to avoid bash float issues
 T_STAR_VALUES=($("$PYTHON" -c "
 import numpy as np
-vals = np.linspace(0.5, 2.0, 21)
+vals = np.linspace(0.5, 2.0, 41)
 print(' '.join(f'{v:.4f}' for v in vals))
 "))
 

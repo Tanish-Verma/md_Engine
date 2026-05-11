@@ -9,6 +9,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from md_engine import MDSimulation, SimulationConfig
 
+N_CELLS = 4
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rho",    type=float, required=True)
@@ -36,7 +38,7 @@ def main():
     t0 = time.time()
 
     config = SimulationConfig(
-        n_cells      = 10,
+        n_cells      = N_CELLS,
         rho_star     = rho,
         t_star_values= [T_star],   # single temperature per job
         prod_steps   = 6000,
