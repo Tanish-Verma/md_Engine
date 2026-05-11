@@ -13,7 +13,7 @@ from matplotlib.colors import ListedColormap
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from md_engine import MDSimulation, SimulationConfig
 
-N_CELLS    = 10
+N_CELLS    = 4
 DATA_DIR   = Path(f"data_{N_CELLS}")
 FILE_GLOB  = "result_rho*_T*.h5"
 
@@ -200,7 +200,7 @@ def plot_vt_diagrams(results, save_path="phase_diagram_VT.pdf"):
     # ── unique phases present in data ─────────────────────────────────────
     unique_phases = sorted(set(phases))
  
-    fig, ax = plt.subplots(figsize=(9, 6))
+    fig, ax = plt.subplots(figsize=(12, 10))
     ax.set_facecolor("#0D1117")
     fig.patch.set_facecolor("#0D1117")
  
@@ -250,7 +250,7 @@ def plot_rhot_diagrams(results, save_path="phase_diagram_RHOT.pdf"):
     # ── unique phases present in data ─────────────────────────────────────
     unique_phases = sorted(set(phases))
  
-    fig, ax = plt.subplots(figsize=(12, 8))
+    fig, ax = plt.subplots(figsize=(14, 10))
     ax.set_facecolor("#0D1117")
     fig.patch.set_facecolor("#0D1117")
  
@@ -272,7 +272,7 @@ def plot_rhot_diagrams(results, save_path="phase_diagram_RHOT.pdf"):
                  color="white", fontweight="bold", pad=14)
  
     ax.tick_params(colors="white", labelsize=10)
-    ax.set_xticks(T_vals)
+    # ax.set_xticks(T_vals)
     for spine in ax.spines.values():
         spine.set_edgecolor("#444")
  
@@ -293,6 +293,6 @@ def plot_rhot_diagrams(results, save_path="phase_diagram_RHOT.pdf"):
 
 if __name__ == "__main__":
     results = load_all_files(verbose=False)
-    plot_pt_diagram(results)
+    # plot_pt_diagram(results)
     plot_vt_diagrams(results)
-    plot_rhot_diagrams(results)
+    # plot_rhot_diagrams(results)

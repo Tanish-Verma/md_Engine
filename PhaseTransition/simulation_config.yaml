@@ -1,7 +1,7 @@
 sigma: 3.65
 eps: 0.014
-n_cells: 10
-rho_star: 1.0
+n_cells: 4
+rho_star: 2.0
 cell_param_a: null
 dt: 0.005
 r_cutoff: 2.5
